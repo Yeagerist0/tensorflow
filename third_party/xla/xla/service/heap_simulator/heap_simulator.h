@@ -1075,6 +1075,7 @@ class GlobalDecreasingSizeBestFitHeap : public HeapAlgorithm<BufferType> {
 
   // Temporary buffers used by MakeFreeChunks to avoid reallocating memory.
   mutable std::vector<Chunk> used_chunks_;
+  mutable std::vector<Chunk> radix_scratch_;
   mutable std::vector<std::pair<int64_t, int64_t>> free_chunks_list_;
 
  protected:

@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/service/heap_simulator/heap_simulator.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -2053,6 +2054,81 @@ std::string RenderTimeByFreeChunks(
   return absl::StrJoin(lines, "\n");
 }
 
+// Sorts `chunks` in ascending order of `Chunk::offset` using an 8-bit Least
+// Significant Digit (LSD) radix sort.
+//
+// Optimizations:
+// 1. Bit-skipping: A 64-bit radix sort normally runs 8 passes,
+//    but in practice many bytes are identical across all chunks (e.g. upper
+//    bytes for memory under 32 GB, or lower bits from alignment). By XORing
+//    each offset against the first (`diff_bits |= offset ^ first`), any byte
+//    where `diff_bits` is 0 has zero differences across the entire array.
+//    Skipping these uniform passes avoids useless work.
+// 2. Scratch reuse: Reuses caller-provided `scratch` buffer to eliminate
+//    repeated dynamic memory allocations across simulator calls.
+// 3. Small-size fallback: For small arrays (N < 4000), falls back to
+//    absl::c_sort to avoid counting-histogram overhead on small inputs.
+void LsdRadixSortChunks(absl::Span<HeapSimulator::Chunk> chunks,
+                        std::vector<HeapSimulator::Chunk>& scratch) {
+  using Chunk = HeapSimulator::Chunk;
+  const size_t n = chunks.size();
+  if (n < 4000) {
+    absl::c_sort(chunks, [](const Chunk& a, const Chunk& b) {
+      return a.offset < b.offset;
+    });
+    return;
+  }
+
+  // Determine which 8-bit byte positions contain variations across elements.
+  const uint64_t first_key = static_cast<uint64_t>(chunks[0].offset);
+  uint64_t diff_bits = 0;
+  for (size_t i = 1; i < n; ++i) {
+    diff_bits |= (static_cast<uint64_t>(chunks[i].offset) ^ first_key);
+  }
+
+  scratch.resize(n);
+  Chunk* src = chunks.data();
+  Chunk* dst = scratch.data();
+
+  constexpr int kRadixBits = 8;
+  constexpr int kRadixBuckets = 1 << kRadixBits;
+  constexpr uint64_t kByteMask = kRadixBuckets - 1;
+
+  for (int shift = 0; shift < 64; shift += kRadixBits) {
+    if (((diff_bits >> shift) & kByteMask) == 0) {
+      continue;
+    }
+
+    std::array<size_t, kRadixBuckets> count = {};
+    for (size_t i = 0; i < n; ++i) {
+      const uint8_t byte = static_cast<uint8_t>(
+          (static_cast<uint64_t>(src[i].offset) >> shift) & kByteMask);
+      ++count[byte];
+    }
+
+    std::array<size_t, kRadixBuckets> prefix;
+    size_t sum = 0;
+    for (int b = 0; b < kRadixBuckets; ++b) {
+      prefix[b] = sum;
+      sum += count[b];
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+      const uint8_t byte = static_cast<uint8_t>(
+          (static_cast<uint64_t>(src[i].offset) >> shift) & kByteMask);
+      dst[prefix[byte]++] = src[i];
+    }
+
+    std::swap(src, dst);
+  }
+
+  // Because we swap `src` and `dst` after each pass, if an odd number of passes
+  // were performed, copy results back to `chunks`.
+  if (src != chunks.data()) {
+    std::copy(src, src + n, chunks.data());
+  }
+}
+
 }  // namespace
 
 template <typename BufferType>
@@ -2589,8 +2665,17 @@ GlobalDecreasingSizeBestFitHeap<BufferType>::MakeFreeChunksList(
   }
 
   // Sort used chunks by offset ascending.
-  std::sort(used_chunks_.begin(), used_chunks_.end(),
-            [](const Chunk& a, const Chunk& b) { return a.offset < b.offset; });
+  // For small-to-medium lists, standard sort is faster because it fits in L1
+  // cache and avoids radix sort's buffer setup. Empirically for `Chunk` arrays
+  // of size between 8 and 256K, found elbow-point at ~4,000 chunks, after which
+  // radix sort pulls ahead since it avoids cache misses.
+  if (used_chunks_.size() < 4000) {
+    absl::c_sort(used_chunks_, [](const Chunk& a, const Chunk& b) {
+      return a.offset < b.offset;
+    });
+  } else {
+    LsdRadixSortChunks(absl::MakeSpan(used_chunks_), radix_scratch_);
+  }
 
   free_chunks_list_.clear();
   if (used_chunks_.empty()) {
