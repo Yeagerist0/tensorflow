@@ -535,6 +535,15 @@ int64_t GetReduceFlops(const HloInstruction* reduce) {
   return ShapeUtil::ElementsIn(reduce->shape()) * (reduce_product - 1);
 }
 
+// Returns true if any edge padding is negative, i.e. the pad crops its operand.
+bool HasNegativePadding(const PaddingConfig& config) {
+  return absl::c_any_of(config.dimensions(),
+                        [](const PaddingConfig::PaddingConfigDimension& dim) {
+                          return dim.edge_padding_low() < 0 ||
+                                 dim.edge_padding_high() < 0;
+                        });
+}
+
 }  // namespace
 
 bool AlgebraicSimplifierVisitor::IsNonNegative(
@@ -5891,21 +5900,30 @@ absl::Status AlgebraicSimplifierVisitor::HandleConvert(
 
 absl::Status AlgebraicSimplifierVisitor::HandleCustomCall(
     HloInstruction* custom_call) {
-  // Remove redundant slice to dynamic of pad to static
+  // Remove redundant SliceToDynamic of PadToStatic. The dynamic padder
+  // wraps the size operand in clamp(0, size, bound); looking through it is
+  // value-preserving since PadToStatic sizes are within bounds.
   HloInstruction *pad_to_static0, *pad_to_static1, *pad_to_static_operand;
-  if (Match(
-          custom_call,
-          m::CustomCall(
-              {"SliceToDynamic"},
-              m::GetTupleElement(m::CustomCall(&pad_to_static0, {"PadToStatic"},
-                                               m::Op(&pad_to_static_operand)),
-                                 0),
-              m::GetTupleElement(
-                  m::CustomCall(&pad_to_static1, {"PadToStatic"}, m::Op()),
-                  1))) &&
-      pad_to_static0 == pad_to_static1 &&
-      SameShape(custom_call->shape(), pad_to_static_operand->shape())) {
-    return ReplaceInstruction(custom_call, pad_to_static_operand);
+  if (custom_call->shape().IsArray() &&
+      custom_call->shape().dimensions().size() == 1) {
+    auto size_gte = m::GetTupleElement(
+        m::CustomCall(&pad_to_static1, {"PadToStatic"}, m::Op()), 1);
+    if (Match(custom_call,
+              m::CustomCall(
+                  {"SliceToDynamic"},
+                  m::GetTupleElement(
+                      m::CustomCall(&pad_to_static0, {"PadToStatic"},
+                                    m::Op(&pad_to_static_operand)),
+                      0),
+                  m::AnyOf<HloInstruction>(
+                      size_gte,
+                      m::Clamp(m::ConstantScalar(0), size_gte,
+                               m::ConstantScalar(
+                                   custom_call->shape().dimensions(0)))))) &&
+        pad_to_static0 == pad_to_static1 &&
+        SameShape(custom_call->shape(), pad_to_static_operand->shape())) {
+      return ReplaceInstruction(custom_call, pad_to_static_operand);
+    }
   }
   if (options_.is_layout_sensitive() &&
       custom_call->IsCustomCall("LayoutConstraint")) {
@@ -9648,6 +9666,12 @@ absl::Status AlgebraicSimplifierVisitor::HandleReduceWindow(
     return absl::OkStatus();
   }
 
+  // A cropping pad does not compose with the window padding by addition.
+  if (HasNegativePadding(pad_config)) {
+    VLOG(10) << "Not folding negative pad into reduce-window.";
+    return absl::OkStatus();
+  }
+
   // If reduce_window already has padding, the pad value of the pad op and the
   // init value of reduce_window must match to allow folding the pad.
   const HloInstruction* pad_value = pad->operand(1);
@@ -10417,6 +10441,11 @@ absl::StatusOr<bool> AlgebraicSimplifierVisitor::FoldConvInputPad(
           p.interior_padding() != 0) {
         return false;
       }
+    }
+
+    // A cropping pad does not compose with the window padding by addition.
+    if (HasNegativePadding(padding)) {
+      return false;
     }
 
     // Compute the window which is the result of merging the kPad and the
