@@ -1069,6 +1069,9 @@ _VALID_OP_NAME_REGEX: Pattern[str] = re.compile(
     r"^[A-Za-z0-9.][A-Za-z0-9_.\\/>-]*$")
 _VALID_SCOPE_NAME_REGEX: Pattern[str] = re.compile(
     r"^[A-Za-z0-9_.\\/>-]*$")
+# Whitespace in a scope name is rejected in eager mode too: it is never
+# usable, and a name containing it already fails once the same code is traced.
+_WHITESPACE_IN_SCOPE_NAME_REGEX: Pattern[str] = re.compile(r"\s")
 
 
 @tf_export("__internal__.create_c_op", v1=[])
@@ -5857,6 +5860,20 @@ class name_scope_v2(contextlib.AbstractContextManager[str]):
       # This also prevents auto-incrementing.
       old_name = ctx.scope_name
       name = self._name
+      if name:
+        if _WHITESPACE_IN_SCOPE_NAME_REGEX.search(name):
+          raise ValueError(
+              f"'{name}' is not a valid scope name. A scope name cannot "
+              f"contain whitespace.")
+        if not _VALID_SCOPE_NAME_REGEX.match(name):
+          # Eager mode has always accepted these, and callers rely on it (for
+          # example Keras metric names such as "Recall@1"), so warn instead of
+          # breaking them.
+          logging.warning(
+              "'%s' is not a valid scope name and may be rejected in a future "
+              "version of TensorFlow. A scope name should match the following "
+              "pattern: %s", name, _VALID_SCOPE_NAME_REGEX.pattern)
+
       if not name:
         scope_name = ""
       elif name[-1] == "/":

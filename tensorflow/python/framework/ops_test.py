@@ -2639,6 +2639,49 @@ class OpScopeTest(test_util.TensorFlowTestCase):
     with bar as scope_name:
       self.assertEqual("bar/", scope_name)
 
+  @test_util.run_in_graph_and_eager_modes
+  def testNameScopeV2RejectsWhitespace(self):
+    """Whitespace in a scope name raises in eager mode as it does in graph."""
+    invalid_msg = "is not a valid (root )?scope name"
+    with self.assertRaisesRegex(ValueError, invalid_msg):
+      with ops.name_scope_v2("scope with spaces"):
+        pass
+    with ops.name_scope_v2("valid_outer"):
+      with self.assertRaisesRegex(ValueError, invalid_msg):
+        with ops.name_scope_v2("scope with spaces"):
+          pass
+    # Rejected before the trailing slash is interpreted as an absolute name.
+    with self.assertRaisesRegex(ValueError, invalid_msg):
+      with ops.name_scope_v2("invalid space/"):
+        pass
+    with self.assertRaisesRegex(ValueError, invalid_msg):
+      with ops.name_scope_v2("tab\tseparated"):
+        pass
+
+  @test_util.run_in_graph_and_eager_modes
+  def testNameScopeV2EagerKeepsAcceptingExistingNames(self):
+    """Names eager mode has always accepted must keep working."""
+    if not context.executing_eagerly():
+      self.skipTest("Graph mode validates scope names separately.")
+    # Keras opens a name scope per metric name, and "@" is common in those.
+    with ops.name_scope_v2("recall/Recall@1"):
+      pass
+    with ops.name_scope_v2("MAP@k"):
+      pass
+    # Leading underscores, root resets, and names derived from tensor names
+    # (which carry an output index) are all in use today.
+    with ops.name_scope_v2("_private"):
+      pass
+    with ops.name_scope_v2("/"):
+      pass
+    with ops.name_scope_v2("video:0_accumulators"):
+      pass
+    with ops.name_scope_v2("valid_outer"):
+      with ops.name_scope_v2("video:0_accumulators"):
+        pass
+    v = variables.Variable(1.0, name="_private_var")
+    self.assertEqual(1.0, self.evaluate(v))
+
   @test_util.run_deprecated_v1
   def testNoScopeName(self):
     g0 = ops.Graph()
