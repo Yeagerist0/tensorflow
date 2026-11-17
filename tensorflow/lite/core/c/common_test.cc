@@ -110,29 +110,35 @@ TEST(FloatArray, TestFloatArrayCopy) {
 }
 
 TEST(Types, TestTypeNames) {
-  auto type_name = [](TfLiteType t) {
-    return std::string(TfLiteTypeGetName(t));
-  };
-  EXPECT_EQ(type_name(kTfLiteNoType), "NOTYPE");
-  EXPECT_EQ(type_name(kTfLiteFloat64), "FLOAT64");
-  EXPECT_EQ(type_name(kTfLiteFloat32), "FLOAT32");
-  EXPECT_EQ(type_name(kTfLiteFloat16), "FLOAT16");
-  EXPECT_EQ(type_name(kTfLiteBFloat16), "BFLOAT16");
-  EXPECT_EQ(type_name(kTfLiteInt16), "INT16");
-  EXPECT_EQ(type_name(kTfLiteUInt16), "UINT16");
-  EXPECT_EQ(type_name(kTfLiteInt32), "INT32");
-  EXPECT_EQ(type_name(kTfLiteUInt32), "UINT32");
-  EXPECT_EQ(type_name(kTfLiteUInt8), "UINT8");
-  EXPECT_EQ(type_name(kTfLiteUInt64), "UINT64");
-  EXPECT_EQ(type_name(kTfLiteInt8), "INT8");
-  EXPECT_EQ(type_name(kTfLiteInt64), "INT64");
-  EXPECT_EQ(type_name(kTfLiteBool), "BOOL");
-  EXPECT_EQ(type_name(kTfLiteComplex64), "COMPLEX64");
-  EXPECT_EQ(type_name(kTfLiteComplex128), "COMPLEX128");
-  EXPECT_EQ(type_name(kTfLiteString), "STRING");
-  EXPECT_EQ(type_name(kTfLiteResource), "RESOURCE");
-  EXPECT_EQ(type_name(kTfLiteVariant), "VARIANT");
-  EXPECT_EQ(type_name(kTfLiteInt4), "INT4");
+  EXPECT_STREQ(GetName(kTfLiteNoType), "NOTYPE");
+  EXPECT_STREQ(GetName(kTfLiteFloat64), "FLOAT64");
+  EXPECT_STREQ(GetName(kTfLiteFloat32), "FLOAT32");
+  EXPECT_STREQ(GetName(kTfLiteFloat16), "FLOAT16");
+  EXPECT_STREQ(GetName(kTfLiteBFloat16), "BFLOAT16");
+  EXPECT_STREQ(GetName(kTfLiteInt16), "INT16");
+  EXPECT_STREQ(GetName(kTfLiteUInt16), "UINT16");
+  EXPECT_STREQ(GetName(kTfLiteInt32), "INT32");
+  EXPECT_STREQ(GetName(kTfLiteUInt32), "UINT32");
+  EXPECT_STREQ(GetName(kTfLiteUInt8), "UINT8");
+  EXPECT_STREQ(GetName(kTfLiteUInt64), "UINT64");
+  EXPECT_STREQ(GetName(kTfLiteInt8), "INT8");
+  EXPECT_STREQ(GetName(kTfLiteInt64), "INT64");
+  EXPECT_STREQ(GetName(kTfLiteBool), "BOOL");
+  EXPECT_STREQ(GetName(kTfLiteComplex64), "COMPLEX64");
+  EXPECT_STREQ(GetName(kTfLiteComplex128), "COMPLEX128");
+  EXPECT_STREQ(GetName(kTfLiteString), "STRING");
+  EXPECT_STREQ(GetName(kTfLiteResource), "RESOURCE");
+  EXPECT_STREQ(GetName(kTfLiteVariant), "VARIANT");
+  EXPECT_STREQ(GetName(kTfLiteInt4), "INT4");
+}
+
+TEST(Types, TestQuantizationTypeNames) {
+  EXPECT_STREQ(GetName(kTfLiteNoQuantization), "None");
+  EXPECT_STREQ(GetName(kTfLiteAffineQuantization), "Affine");
+  EXPECT_STREQ(GetName(kTfLiteBlockwiseQuantization), "Blockwise");
+  EXPECT_STREQ(GetName(kTfLiteMultiAxisQuantization), "MultiAxis");
+  EXPECT_STREQ(GetName(kTfLiteBlockwiseQuantizationV2), "BlockwiseV2");
+  EXPECT_STREQ(GetName(static_cast<TfLiteQuantizationType>(-1)), "Unknown");
 }
 
 TEST(Quantization, TestQuantizationFree) {
@@ -175,6 +181,37 @@ TEST(Quantization, TestMultiAxisQuantizationCloneAndFree) {
   EXPECT_THAT(clone_params->quantized_dimensions,
               TfLiteArrayIs(params->quantized_dimensions));
   EXPECT_NE(clone_params->quantized_dimensions, params->quantized_dimensions);
+
+  TfLiteQuantizationFree(&clone);
+  TfLiteQuantizationFree(&quantization);
+}
+
+TEST(Quantization, TestBlockwiseQuantizationV2CloneAndFree) {
+  auto* params = reinterpret_cast<TfLiteBlockwiseQuantizationV2*>(
+      malloc(sizeof(TfLiteBlockwiseQuantizationV2)));
+  params->scale = 1;
+  params->zero_point = 2;
+  params->blocksize = 0;
+  params->quantized_dimension = 0;
+  params->block_shape = BuildTfLiteArray<int>({1, 1, 32}).release();
+  TfLiteQuantization quantization = {
+      /*type=*/kTfLiteBlockwiseQuantizationV2,
+      /*params=*/params,
+  };
+
+  TfLiteQuantization clone = TfLiteQuantizationClone(quantization);
+
+  EXPECT_THAT(clone.type, Eq(kTfLiteBlockwiseQuantizationV2));
+  ASSERT_THAT(clone.params, Not(AnyOf(nullptr, quantization.params)));
+  auto* clone_params =
+      reinterpret_cast<TfLiteBlockwiseQuantizationV2*>(clone.params);
+  EXPECT_THAT(clone_params->scale, Eq(params->scale));
+  EXPECT_THAT(clone_params->zero_point, Eq(params->zero_point));
+  EXPECT_THAT(clone_params->blocksize, Eq(params->blocksize));
+  EXPECT_THAT(clone_params->quantized_dimension,
+              Eq(params->quantized_dimension));
+  EXPECT_THAT(clone_params->block_shape, TfLiteArrayIs(params->block_shape));
+  EXPECT_NE(clone_params->block_shape, params->block_shape);
 
   TfLiteQuantizationFree(&clone);
   TfLiteQuantizationFree(&quantization);

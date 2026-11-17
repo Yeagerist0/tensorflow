@@ -41,6 +41,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk.pb.h"
 #include "xla/backends/gpu/runtime/thunk_executor.h"
+#include "xla/backends/gpu/runtime/thunk_test_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
@@ -53,7 +54,6 @@ limitations under the License.
 #include "xla/service/gpu/gpu_executable.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/service/platform_util.h"
-#include "xla/service/service_executable_run_options.h"
 #include "xla/service/shaped_slice.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
@@ -113,7 +113,8 @@ class NoOpCollectiveBroadcastThunk : public CollectiveBroadcastThunk {
                                CollectiveConfig config,
                                std::vector<CollectiveThunk::Buffer> buffers)
       : CollectiveBroadcastThunk(std::move(thunk_info), std::move(config),
-                                 std::move(buffers)) {}
+                                 std::move(buffers),
+                                 /*devices_per_host=*/1) {}
 
   absl::Status ExecuteOnStream(const ExecuteParams&) override {
     return absl::OkStatus();
@@ -207,12 +208,14 @@ ENTRY test_computation {
 
   // ThunkSequence Creation
   auto cb_start_thunk = std::make_unique<CollectiveBroadcastThunk>(
-      Thunk::ThunkInfo{}, cb_instr, std::move(buffers));
+      Thunk::ThunkInfo{}, cb_instr, std::move(buffers),
+      /*devices_per_host=*/1);
 
   ThunkSequence start_sequence;
   start_sequence.push_back(std::move(cb_start_thunk));
   auto async_start = std::make_unique<AsyncStartThunk>(
-      Thunk::ThunkInfo(), CommunicationStreamId(0), std::move(start_sequence));
+      Thunk::ThunkInfo(), CommunicationStreamId(0), std::move(start_sequence),
+      /*devices_per_host=*/1);
   auto async_done = std::make_unique<AsyncDoneThunk>(
       Thunk::ThunkInfo(), async_start->async_execution());
 
@@ -316,7 +319,8 @@ TEST(CollectiveThunkTest, ProtoRoundTrip) {
   ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<CollectiveBroadcastThunk> thunk,
       CollectiveBroadcastThunk::FromProto(
-          thunk_info, proto.collective_broadcast_thunk(), buffer_allocations));
+          thunk_info, proto.collective_broadcast_thunk(), buffer_allocations,
+          /*devices_per_host=*/1));
 
   ASSERT_OK_AND_ASSIGN(ThunkProto round_trip_proto, thunk->ToProto());
 
@@ -370,13 +374,9 @@ TEST(CollectiveBroadcastThunkTest, RecordCommandBufferCreate) {
   se::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations allocations({src, dst}, 0, &allocator);
 
-  ServiceExecutableRunOptions run_options;
-  Thunk::ExecuteParams execute_params =
-      Thunk::ExecuteParams::Create(run_options, allocations, stream.get(),
-                                   /*command_buffer_trace_stream=*/stream.get(),
-                                   /*collective_params=*/nullptr,
-                                   /*collective_cliques=*/nullptr,
-                                   /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &allocations, stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get());
+  Thunk::ExecuteParams execute_params = thunk_params.ExecuteParams();
 
   CommandStateManager state;
   Command::RecordParams record_params = {state};
@@ -422,15 +422,10 @@ TEST(CollectiveBroadcastThunkTest, RecordCommandBufferUpdate) {
       MakeNoOpThunk(alloc_src, alloc_dst, length);
 
   se::StreamExecutorAddressAllocator allocator(executor);
-  ServiceExecutableRunOptions run_options;
-
   BufferAllocations allocations1({src1, dst1}, 0, &allocator);
-  Thunk::ExecuteParams params1 =
-      Thunk::ExecuteParams::Create(run_options, allocations1, stream.get(),
-                                   /*command_buffer_trace_stream=*/stream.get(),
-                                   /*collective_params=*/nullptr,
-                                   /*collective_cliques=*/nullptr,
-                                   /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &allocations1, stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get());
+  Thunk::ExecuteParams params1 = thunk_params.ExecuteParams();
 
   CommandStateManager state;
   Command::RecordParams record_params = {state};
@@ -450,11 +445,7 @@ TEST(CollectiveBroadcastThunkTest, RecordCommandBufferUpdate) {
 
   BufferAllocations allocations2({src2, dst2}, 0, &allocator);
   Thunk::ExecuteParams params2 =
-      Thunk::ExecuteParams::Create(run_options, allocations2, stream.get(),
-                                   /*command_buffer_trace_stream=*/stream.get(),
-                                   /*collective_params=*/nullptr,
-                                   /*collective_cliques=*/nullptr,
-                                   /*collective_memory=*/nullptr);
+      thunk_params.WithBufferAllocations(&allocations2).ExecuteParams();
 
   std::vector<BufferAllocation::Index> updated_allocs = {0, 1};
   Command::RecordParams record_params2 = {state, std::move(updated_allocs)};

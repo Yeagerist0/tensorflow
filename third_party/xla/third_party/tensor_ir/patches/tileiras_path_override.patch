@@ -1,0 +1,160 @@
+diff --git a/include/tensor_ir/Support/TileIRAssembly.h b/include/tensor_ir/Support/TileIRAssembly.h
+--- a/include/tensor_ir/Support/TileIRAssembly.h
++++ b/include/tensor_ir/Support/TileIRAssembly.h
+@@ -10,12 +10,24 @@
+ 
+ #include "llvm/ADT/ArrayRef.h"
+ #include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/StringRef.h"
+ #include "llvm/Support/raw_ostream.h"
+ 
+ #include "cuda_tile/Bytecode/Common/Version.h"
+ #include <optional>
++#include <string>
+ 
+ namespace mlir::nv_tensor_ir::backend::cuda_tile {
++
++/// Overrides the 'tileiras' executable that assembleTileIRToCubin() invokes
++/// and the environment it runs in. By default the assembler is searched for in
++/// options.codegen.tileirasPath, getCudaToolkitPath()/bin, and PATH, and
++/// inherits the environment of the calling process, which a host that stages
++/// its tools in a private directory cannot arrange. An empty path restores the
++/// default lookup; an empty environment restores inheritance. Environment
++/// entries are "NAME=value" strings.
++void setTileIRAssembler(llvm::StringRef path,
++                        llvm::ArrayRef<std::string> environment = {});
+ 
+ /// Assemble TileIR bytecode for the target, checking bytecodeVersion if given.
+ /// Returns std::nullopt when the assembler is unavailable or incompatible;
+diff --git a/lib/Support/TileIRAssembly.cpp b/lib/Support/TileIRAssembly.cpp
+--- a/lib/Support/TileIRAssembly.cpp
++++ b/lib/Support/TileIRAssembly.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include <algorithm>
+ #include <memory>
++#include <mutex>
+ #include <optional>
+ #include <string>
+ #include <utility>
+@@ -38,7 +39,30 @@
+   int exitCode;
+   std::string error;
+ };
++
++/// The assembler installed with setTileIRAssembler().
++struct AssemblerOverride {
++  std::string path;
++  std::vector<std::string> environment;
++};
+ } // namespace
++
++/// Guards assemblerOverride(). Hosts install the override once during start-up
++/// but may assemble from several threads afterwards.
++static std::mutex &assemblerOverrideMutex() {
++  static std::mutex *mutex = new std::mutex();
++  return *mutex;
++}
++
++static AssemblerOverride &assemblerOverride() {
++  static AssemblerOverride *override = new AssemblerOverride();
++  return *override;
++}
++
++static AssemblerOverride getAssemblerOverride() {
++  std::lock_guard<std::mutex> lock(assemblerOverrideMutex());
++  return assemblerOverride();
++}
+ 
+ static StatusOr<TemporaryFile> createTemporaryFile(llvm::StringRef suffix) {
+   llvm::SmallString<128> path;
+@@ -102,16 +126,16 @@
+           : Status::CompilationError(status.message() + "; " + extra.message());
+ }
+ 
+-static ProcessResult runProgram(llvm::StringRef program,
+-                                llvm::ArrayRef<llvm::StringRef> args,
+-                                llvm::StringRef stdoutPath,
+-                                llvm::StringRef stderrPath) {
++static ProcessResult
++runProgram(llvm::StringRef program, llvm::ArrayRef<llvm::StringRef> args,
++           std::optional<llvm::ArrayRef<llvm::StringRef>> env,
++           llvm::StringRef stdoutPath, llvm::StringRef stderrPath) {
+   llvm::SmallVector<std::optional<llvm::StringRef>, 3> redirects{
+       llvm::StringRef(""), stdoutPath, stderrPath};
+   ProcessResult result{};
+-  result.exitCode = llvm::sys::ExecuteAndWait(
+-      program, args, /*Env=*/std::nullopt, redirects, /*SecondsToWait=*/0,
+-      /*MemoryLimit=*/0, &result.error);
++  result.exitCode = llvm::sys::ExecuteAndWait(program, args, env, redirects,
++                                              /*SecondsToWait=*/0,
++                                              /*MemoryLimit=*/0, &result.error);
+   return result;
+ }
+ 
+@@ -128,13 +152,17 @@
+   return Status::CompilationError(std::move(message));
+ }
+ 
+-static StatusOr<std::string> findTileiras(const CompilerInvocation &options) {
++static StatusOr<std::string> findTileiras(const CompilerInvocation &options,
++                                          llvm::StringRef overridePath) {
+   if (!options.codegen.tileirasPath.empty()) {
+     if (!llvm::sys::fs::can_execute(options.codegen.tileirasPath)) {
+       return Status::NotFound("configured --tileiras-path is unavailable: " +
+                               options.codegen.tileirasPath);
+     }
+     return options.codegen.tileirasPath;
++  }
++  if (!overridePath.empty()) {
++    return overridePath.str();
+   }
+   if (std::string toolkitPath = options.getCudaToolkitPath();
+       !toolkitPath.empty()) {
+@@ -157,7 +185,12 @@
+     std::optional<mlir::cuda_tile::BytecodeVersion> bytecodeVersion,
+     const CompilerInvocation &options, const RemarkFilters *remarkFilters,
+     llvm::raw_ostream &remarksStream) {
+-  TIR_ASSIGN_OR_RETURN(auto program, findTileiras(options));
++  AssemblerOverride override = getAssemblerOverride();
++  TIR_ASSIGN_OR_RETURN(auto program, findTileiras(options, override.path));
++  std::optional<llvm::SmallVector<llvm::StringRef, 16>> env;
++  if (!override.environment.empty()) {
++    env.emplace(override.environment.begin(), override.environment.end());
++  }
+ 
+   TIR_ASSIGN_OR_RETURN(auto stdoutFile, createTemporaryFile("stdout"));
+   TIR_ASSIGN_OR_RETURN(auto stderrFile, createTemporaryFile("stderr"));
+@@ -169,7 +202,7 @@
+     llvm::SmallVector<llvm::StringRef, 2> versionArgs{program,
+                                                       "--list-versions"};
+     ProcessResult query =
+-        runProgram(program, versionArgs, stdoutFile.path, stderrFile.path);
++        runProgram(program, versionArgs, env, stdoutFile.path, stderrFile.path);
+     if (query.exitCode != 0) {
+       return processError("tileiras --list-versions", query, stderrFile.path);
+     }
+@@ -224,7 +257,7 @@
+     args.push_back(arg);
+   }
+   ProcessResult compile =
+-      runProgram(program, args, stdoutFile.path, stderrFile.path);
++      runProgram(program, args, env, stdoutFile.path, stderrFile.path);
+   Status status =
+       compile.exitCode == 0
+           ? Status::Ok()
+@@ -253,6 +286,14 @@
+ static bool isUnavailable(const Status &status) {
+   return status.code() == StatusCode::kNotFound ||
+          status.code() == StatusCode::kNotSupported;
++}
++
++void mlir::nv_tensor_ir::backend::cuda_tile::setTileIRAssembler(
++    llvm::StringRef path, llvm::ArrayRef<std::string> environment) {
++  std::lock_guard<std::mutex> lock(assemblerOverrideMutex());
++  assemblerOverride().path = path.str();
++  assemblerOverride().environment.assign(environment.begin(),
++                                         environment.end());
+ }
+ 
+ StatusOr<std::optional<llvm::SmallVector<char, 0>>>

@@ -37,16 +37,17 @@ limitations under the License.
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
-#include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
-#include "mlir/Dialect/AMDGPU/Utils/Chipset.h"
+#include "mlir/Dialect/AMDGPU/IR/AMDGPUDialectDecl.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"  // IWYU pragma: keep
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"  // IWYU pragma: keep
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"  // IWYU pragma: keep
+#include "mlir/Dialect/LLVMIR/ROCDLTargetInfo.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/PatternMatch.h"
@@ -222,6 +223,29 @@ struct ExpBF16ToAMDGPU
   }
 };
 
+// Lowers scalar `math.fma` directly to `llvm.intr.fma` instead of
+// MathToNVVM's libdevice `@__nv_fmaf` / `@__nv_fma` call. In particular,
+// MathToNVVM (`populateOpPatterns<math::FmaOp>` in `MathToNVVM.cpp` via
+// `OpToFuncCallLowering::maybeCast` in `OpToFuncCallLowering.h`) upcasts `f16`
+// and `bf16` `math.fma` to `f32`, calls `@__nv_fmaf`, and truncates back, which
+// double-rounds instead of using the native `fma.rn.f16` / `fma.rn.bf16`
+// instruction.
+class FmaToLLVM : public mlir::ConvertOpToLLVMPattern<mlir::math::FmaOp> {
+ public:
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::math::FmaOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    if (!mlir::isa<mlir::FloatType>(op.getType())) {
+      return rewriter.notifyMatchFailure(op, "not a scalar float fma");
+    }
+    rewriter.replaceOpWithNewOp<mlir::LLVM::FMAOp>(
+        op, adaptor.getA(), adaptor.getB(), adaptor.getC());
+    return mlir::success();
+  }
+};
+
 class LowerToLLVMGPUPass
     : public impl::LowerToLLVMGPUPassBase<LowerToLLVMGPUPass> {
  public:
@@ -251,19 +275,18 @@ class LowerToLLVMGPUPass
       if (device_spec_.IsAmdGpu()) {
         std::string chipset =
             device_spec_.gpu().rocm_compute_capability().gfx_version();
-        llvm::FailureOr<mlir::amdgpu::Chipset> maybeChipset =
-            mlir::amdgpu::Chipset::parse(chipset);
-        if (mlir::failed(maybeChipset)) {
+        llvm::FailureOr<mlir::ROCDL::TargetInfo> targetInfo =
+            mlir::ROCDL::TargetInfo::get(chipset);
+        if (mlir::failed(targetInfo)) {
           mlir::emitError(mlir::UnknownLoc::get(&getContext()),
-                          "Invalid chipset name: " + chipset);
+                          "Invalid chipset/target name: " + chipset);
           return mlir::failure();
         }
         mlir::populateGpuToROCDLConversionPatterns(
-            converter, patterns, mlir::gpu::amd::Runtime::Unknown,
-            *maybeChipset);
+            converter, patterns, mlir::gpu::amd::Runtime::Unknown, *targetInfo);
         mlir::configureGpuToROCDLConversionLegality(target);
         mlir::populateAMDGPUToROCDLConversionPatterns(converter, patterns,
-                                                      *maybeChipset);
+                                                      *targetInfo);
         // Higher benefit than the default MathToROCDL patterns so these win for
         // scalar bf16 ops.
         mlir::PatternBenefit benefit(2);
@@ -307,6 +330,7 @@ class LowerToLLVMGPUPass
       } else {
         mlir::populateGpuToNVVMConversionPatterns(converter, patterns);
         mlir::configureGpuToNVVMConversionLegality(target);
+        patterns.add<FmaToLLVM>(converter, mlir::PatternBenefit(2));
       }
       return mlir::success();
     };

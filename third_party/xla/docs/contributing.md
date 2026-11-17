@@ -109,38 +109,12 @@ be no pointers to `HloInstruction` or to other parts of the compiler or the
 
 ##### GPU Compatibility Window {#gpu-compatibility-window}
 
-XLA:GPU guarantees the following compatibility windows between the compiler
-that produces a serialized program and the runtime that executes it:
+XLA:GPU guarantees 6 months of backward compatibility (runtimes must execute
+programs compiled up to 6 months earlier) and 2 weeks of forward compatibility
+(runtimes up to 2 weeks older must execute newly compiled programs).
 
-*   **6 months backward compatibility**: a runtime must be able to execute
-    programs compiled by a version of XLA up to 6 months older.
-*   **2 weeks forward compatibility**: a program compiled by a newer version of
-    XLA must run on a runtime that is up to 2 weeks older.
-
-**Backward compatibility** means the runtime must keep executing everything
-older compilers may have emitted, so existing thunks must not be removed from
-the runtime. To retire a thunk, first stop emitting it from the compiler, and
-only remove its runtime support 6 months later.
-
-**Forward compatibility** means the compiler must not emit anything the runtime
-cannot yet deserialize or execute. Changes that affect the serialized thunk
-sequence, such as adding a new thunk kind or a field the runtime must
-understand, must therefore land in two stages:
-
-1.  **Runtime first.** Add the thunk, its proto definitions, and
-    deserialization support, without emitting it from the compiler.
-2.  **Compiler after 2 weeks.** Once the runtime change has been submitted for
-    at least 2 weeks, enable emission in the compiler (e.g. thunk emitter, HLO
-    passes that produce the new op).
-
-There are two ways to do this:
-
-*   Split the change into two PRs and send the compiler PR once the runtime
-    change is 2 weeks old.
-*   Land both in a single PR, but guard the compiler side behind a
-    [feature flag](#code-standards) that is off by default, and flip it in a
-    follow-up after 2 weeks. This also lets you test the full path end to end
-    in the meantime.
+For detailed rules, change triage, rollout procedures, and testing guidance,
+see the [GPU AOT compatibility guide](gpu_aot_compatibility.md).
 
 ### Code standards
 
@@ -174,9 +148,43 @@ There are two ways to do this:
     of the flag flip if problems arise, and affected users can temporarily
     set the flag themselves before a rollback is performed.
 
+*   *Preprocessor Conditionals (`#ifdef`)*: Avoid using `#if` / `#ifdef` for
+    backend-, hardware-, or version-specific logic whenever possible. Prefer
+    runtime checks via `StreamExecutor`'s `DeviceDescription` or separate build
+    targets. See [The Hitchhiker's Guide to Fewer `#ifdef`s in XLA](./avoiding_ifdefs.md)
+    for details and examples.
+
+*   *Reproducer-first bugfix workflow*:
+    1.  Write a minimal unit test that reproduces the bug.
+    2.  Verify that the test fails on the unpatched codebase for the expected
+        reason.
+    3.  Implement the minimal root-cause fix and verify the test passes.
+    4.  Never hide bugs by weakening assertions, widening numerical tolerances
+        without mathematical justification, or adding `GTEST_SKIP()`.
+
+*   *PR Title and Description*:
+    *   Prefix the title with the component tag in brackets followed by a
+        concise summary (for example,
+        `[XLA:GPU] Skip Triton dot emitter when contracting dimension is zero`).
+    *   Structure the description around why the change is needed rather than a
+        file-by-file summary of the diff:
+        *   **Status quo**: What the system currently does.
+        *   **Why**: Why the current behavior fails or is insufficient.
+        *   **Design choices**: The technical approach taken and why.
+        *   **Trade-offs / Alternatives**: Any compromises accepted and why
+            alternatives were not chosen.
+
+*   *Cross-Repository Patches*: If a PR depends on a simultaneous change in
+    Shardy or StableHLO (pinned in `workspace0.bzl` / `workspace.bzl`), update
+    `third_party/shardy/temporary.patch` or
+    `third_party/stablehlo/temporary.patch` in the same PR so the build remains
+    self-contained.
+
 *   When in doubt as to conventions within the code, it is always a good idea to
     examine pre-existing code and to try to follow the patterns already in place
-    in OpenXLA.
+    in OpenXLA (see also
+    [`xla/AGENTS.md`](https://github.com/openxla/xla/blob/main/xla/AGENTS.md)
+    for C++17, HLO/MLIR, and unit-testing conventions).
 
 
 ### Review Process
@@ -336,12 +344,15 @@ a reproducer of the failure.
 
 At this moment the list of co-maintainers from our partner teams is:
 
-*   [@Tixxx](https://github.com/Tixxx)
-*   [@sergachev](https://github.com/sergachev)
-*   [@jreiffers](https://github.com/jreiffers)
+*   [@draganmladjenovic](https://github.com/draganmladjenovic)
 *   [@ezhulenev](https://github.com/ezhulenev)
+*   [@jreiffers](https://github.com/jreiffers)
+*   [@magaonka-amd](https://github.com/magaonka-amd)
 *   [@mminutoli](https://github.com/mminutoli)
+*   [@nurmukhametov](https://github.com/nurmukhametov)
 *   [@pemeliya](https://github.com/pemeliya)
+*   [@sergachev](https://github.com/sergachev)
+*   [@Tixxx](https://github.com/Tixxx)
 
 ![img](./images/comaintainers.png)
 

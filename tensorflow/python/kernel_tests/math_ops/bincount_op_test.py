@@ -296,6 +296,80 @@ class BincountOpTest(test_util.TensorFlowTestCase, parameterized.TestCase):
       )
     self.assertAllEqual(expected_out, out)
 
+  @test_util.run_gpu_only
+  @test_util.run_in_graph_and_eager_modes
+  @test_util.disable_xla("XLA does not use DeviceHistogram")
+  def test_size_too_large_for_gpu_histogram(self):
+    max_gpu_bins = 2**31 - 1 - 1024
+    with test_util.force_gpu():
+      for bad_size in (max_gpu_bins + 1, 2**31 - 2):
+        size_i32 = array_ops.placeholder_with_default(
+            np.int32(bad_size), shape=[]
+        )
+        with self.assertRaisesRegex(
+            errors.InvalidArgumentError, "must be at most"
+        ):
+          self.evaluate(
+              gen_math_ops.dense_bincount(
+                  input=[0, 1, 1],
+                  weights=[],
+                  size=size_i32,
+                  binary_output=False,
+              )
+          )
+        with self.assertRaisesRegex(
+            errors.InvalidArgumentError, "must be at most"
+        ):
+          self.evaluate(
+              gen_math_ops.bincount(arr=[0, 1, 1], size=size_i32, weights=[])
+          )
+
+      for bad_size_i64 in (max_gpu_bins + 1, 2**31):
+        size_i64 = array_ops.placeholder_with_default(
+            np.int64(bad_size_i64), shape=[]
+        )
+        with self.assertRaisesRegex(
+            errors.InvalidArgumentError, "must be at most"
+        ):
+          self.evaluate(
+              gen_math_ops.dense_bincount(
+                  input=np.array([0, 1, 1], dtype=np.int64),
+                  weights=[],
+                  size=size_i64,
+                  binary_output=False,
+              )
+          )
+
+      overflow_2d_size = array_ops.placeholder_with_default(
+          np.int64(1 << 62), shape=[]
+      )
+      with self.assertRaisesRegex(
+          errors.InvalidArgumentError, "Encountered overflow when multiplying"
+      ):
+        self.evaluate(
+            gen_math_ops.dense_bincount(
+                input=np.zeros((2, 1), dtype=np.int64),
+                weights=[],
+                size=overflow_2d_size,
+                binary_output=False,
+            )
+        )
+
+      empty_high_rows = array_ops.zeros(
+          constant_op.constant([2**31, 0], dtype=dtypes.int64),
+          dtype=dtypes.int32,
+      )
+      zero_size = array_ops.placeholder_with_default(np.int32(0), shape=[])
+      out = self.evaluate(
+          gen_math_ops.dense_bincount(
+              input=empty_high_rows,
+              weights=[],
+              size=zero_size,
+              binary_output=False,
+          )
+      )
+      self.assertEqual(out.shape, (2**31, 0))
+
   def _test_bincount_col_binary_with_negative_input(
       self, num_rows, num_cols, size, dtype
   ):
@@ -756,6 +830,49 @@ class SparseBincountOpTest(test_util.TensorFlowTestCase,
               size=size,
               weights=[]))
 
+  def test_sparse_bincount_rank0_fails(self):
+    # Regression test for the rank-0 guard in SparseBincountOp::Compute
+    # ("dense_shape must have at least 1 dimension"). Without it the kernel
+    # reads dense_shape(0) on an empty dense_shape. Shape inference may reject
+    # the input first, so both messages are accepted.
+    with self.assertRaisesRegex(
+        (ValueError, errors.InvalidArgumentError),
+        "Input must be less than rank 2|"
+        "dense_shape must have at least 1 dimension",
+    ):
+      self.evaluate(
+          gen_math_ops.sparse_bincount(
+              indices=constant_op.constant(
+                  [], shape=[1, 0], dtype=dtypes.int64
+              ),
+              values=[0],
+              dense_shape=constant_op.constant(
+                  [], shape=[0], dtype=dtypes.int64
+              ),
+              size=10,
+              weights=[],
+          )
+      )
+
+  @test_util.run_in_graph_and_eager_modes
+  def test_sparse_bincount_invalid_weights_length(self):
+    # Regression test: the 2-D SparseBincount path reads `weights(i)` with the
+    # value index `i`, so a `weights` shorter than the values would be read out
+    # of bounds. It must be rejected like the 1-D path and DenseBincount do.
+    with self.assertRaisesRegex(
+        (ValueError, errors.InvalidArgumentError),
+        "must be the same length as `values`",
+    ):
+      self.evaluate(
+          gen_math_ops.sparse_bincount(
+              indices=[[0, 0], [1, 0], [2, 0]],
+              values=[1, 1, 1],
+              dense_shape=[3, 2],
+              size=2,
+              weights=[1.0],
+          )
+      )
+
 
 class RaggedBincountOpTest(test_util.TensorFlowTestCase,
                            parameterized.TestCase):
@@ -920,6 +1037,22 @@ class RaggedBincountOpTest(test_util.TensorFlowTestCase,
               weights=[1],
               binary_output=False,
               name=None))
+
+  @test_util.run_in_graph_and_eager_modes
+  def test_ragged_bincount_invalid_weights_length(self):
+    # Regression test: RaggedBincount reads `weights(idx)` with the value
+    # index `idx`, so a `weights` shorter than the values would be read out of
+    # bounds. It must be rejected like the 1-D path and DenseBincount do.
+    with self.assertRaisesRegex(
+        (ValueError, errors.InvalidArgumentError),
+        "must be the same length as `values`",
+    ):
+      self.evaluate(
+          gen_math_ops.ragged_bincount(
+              splits=[0, 3], values=[1, 1, 1], size=2, weights=[1.0]
+          )
+      )
+
 
 if __name__ == "__main__":
   googletest.main()

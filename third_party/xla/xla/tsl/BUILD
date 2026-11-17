@@ -268,6 +268,19 @@ config_setting(
 )
 
 config_setting(
+    name = "linux_aarch64_with_onednn_async",
+    constraint_values =
+        [
+            "@platforms//cpu:aarch64",
+            "@platforms//os:linux",
+        ],
+    define_values = {
+        "build_with_onednn_async": "true",
+    },
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
     name = "linux_armhf",
     constraint_values =
         [
@@ -612,7 +625,9 @@ bzl_library(
     visibility = ["//visibility:public"],
     deps = [
         ":package_groups_bzl",
-        "@rules_cc//cc/common",
+        "@rules_cc//cc/common",  # copybara:comment
+        # copybara:uncomment "@rules_cc//cc/common:cc_common",
+        # copybara:uncomment "@rules_cc//cc/common:cc_info",
     ],
 )
 
@@ -621,7 +636,6 @@ bzl_library(
     srcs = if_google(["tsl.google.bzl"]),
     visibility = ["//visibility:public"],
     deps = [
-        ":package_groups_bzl",
         ":tsl_bzl",
         "//xla/tsl/platform:build_config_root_bzl",
     ] + tsl_google_bzl_deps(),

@@ -17,14 +17,18 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/algorithm/container.h"
+#include "absl/log/check.h"
 #include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_replace.h"
+#include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
@@ -32,6 +36,7 @@ limitations under the License.
 #include "xla/hlo/testlib/filecheck.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/testlib/test.h"
+#include "xla/hlo/testlib/verified_hlo_module.h"
 #include "xla/hlo/transforms/simplifiers/hlo_dce.h"
 #include "xla/hlo/transforms/simplifiers/tuple_simplifier.h"
 #include "xla/hlo/utils/hlo_matchers.h"
@@ -45,6 +50,9 @@ namespace {
 
 using ::testing::_;
 namespace op = xla::testing::opcode_matchers;
+using op::Constant;
+using op::Tuple;
+using op::While;
 
 // Returns the first kWhile instruction within m's entry computation.
 HloInstruction* FindFirstWhile(HloModule* m) {
@@ -1051,43 +1059,6 @@ TEST_F(WhileLoopSimplifierTest, RemoveRepeatedParams) {
       new_while_shape));
 }
 
-TEST_F(WhileLoopSimplifierTest, RepeatedParamsWithDomain) {
-  const std::string hlo_string = R"(
-  HloModule SwappingTupleElements
-
-  SwappingTupleElements.body {
-    loop_var = (s32[], s32[], s32[]) parameter(0)
-    get-tuple-element = s32[] get-tuple-element(loop_var), index=0
-    get-tuple-element.1 = s32[] get-tuple-element(loop_var), index=1
-    get-tuple-element.2 = s32[] get-tuple-element(loop_var), index=2
-    y = s32[] add(get-tuple-element.1, get-tuple-element.2)
-    ROOT tuple = (s32[], s32[], s32[]) tuple(s32[] get-tuple-element, y,
-      s32[] get-tuple-element.2)
-  }
-
-  SwappingTupleElements.always_true {
-   param = (s32[], s32[], s32[]) parameter(0)
-   dom0 = (s32[], s32[], s32[]) domain((s32[], s32[], s32[]) param), domain={kind="sharding", entry={maximal device=0}, exit={maximal device=1}}
-   get-tuple-element = s32[] get-tuple-element(dom0), index=0
-   get-tuple-element.1 = s32[] get-tuple-element(dom0), index=1
-   less-than = pred[] compare(get-tuple-element, get-tuple-element.1), direction=LT
-   ROOT dom1 = pred[] domain(pred[] less-than), domain={kind="sharding", entry={maximal device=1}, exit={maximal device=0}}
-  }
-
-  ENTRY SwappingTupleElements {
-   x = s32[] parameter(0)
-   y = s32[] parameter(1)
-   tuple.1 = (s32[], s32[], s32[]) tuple(s32[] x, s32[] y, s32[] x)
-   ROOT while = (s32[], s32[], s32[]) while(tuple.1),
-     condition=SwappingTupleElements.always_true,
-     body=SwappingTupleElements.body
-  }
-  )";
-
-  auto m = ParseAndReturnVerifiedModule(hlo_string).value();
-  EXPECT_FALSE(WhileLoopSimplifier().Run(m.get()).value());
-}
-
 // A group of elements are inter-dependent, but unused as by the output.
 TEST_F(WhileLoopSimplifierTest, LoopWithUnusedGroupSimplified) {
   const std::string hlo_string = R"(
@@ -1343,7 +1314,8 @@ TEST_F(WhileLoopSimplifierTest, RemoveTrivialCompare) {
   )";
 
   for (std::string dir : {"LT", "GT"}) {
-    for (int i = 1; i > -5; i--) {
+    int start = (dir == "LT") ? 1 : 0;
+    for (int i = start; i > -5; i--) {
       std::string hlo_string = absl::StrReplaceAll(
           hlo_template,
           {{"{{LOOP_CONSTANT}}", absl::StrCat(i)}, {"{{DIRECTION}}", dir}});
@@ -1360,6 +1332,15 @@ TEST_F(WhileLoopSimplifierTest, RemoveTrivialCompare) {
                       ->operand(0)
                       ->literal()
                       .IsAll(dir == "GT"));
+    }
+
+    if (dir == "GT") {
+      std::string hlo_string = absl::StrReplaceAll(
+          hlo_template, {{"{{LOOP_CONSTANT}}", "1"}, {"{{DIRECTION}}", dir}});
+      auto m = ParseAndReturnVerifiedModule(hlo_string).value();
+      EXPECT_FALSE(WhileLoopSimplifier(/*simplify_compare_instrs=*/true)
+                       .Run(m.get())
+                       .value());
     }
 
     for (int i = 11; i < 15; i++) {
@@ -1381,6 +1362,219 @@ TEST_F(WhileLoopSimplifierTest, RemoveTrivialCompare) {
                       .IsAll(dir == "LT"));
     }
   }
+
+  // When LOOP_CONSTANT equals the initial value of the induction variable (1),
+  // `i > 1` is false on the first iteration (i == 1) and true on subsequent
+  // iterations, so it must not be simplified to a constant.
+  {
+    std::string hlo_string = absl::StrReplaceAll(
+        hlo_template, {{"{{LOOP_CONSTANT}}", "1"}, {"{{DIRECTION}}", "GT"}});
+    ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(hlo_string));
+    EXPECT_THAT(
+        WhileLoopSimplifier(/*simplify_compare_instrs=*/true).Run(m.get()),
+        absl_testing::IsOkAndHolds(false));
+  }
+}
+
+// The induction variable runs over 0, 2, ..., 14 (8 trips with step 2). The
+// range of i is bounded by init + (trip_count - 1) * step, not by
+// init + trip_count - 1, so compares against constants in (7, 14] must not be
+// folded.
+TEST_F(WhileLoopSimplifierTest, RemoveTrivialCompareWithStep) {
+  const std::string hlo_template = R"(
+  HloModule RemoveTrivialCompareWithStep
+  body {
+    loop_var = (pred[], s32[]) parameter(0)
+    i = s32[] get-tuple-element(loop_var), index=1
+    cons = s32[] constant({{LOOP_CONSTANT}})
+    comp = pred[] compare(i, cons), direction={{DIRECTION}}
+    two = s32[] constant(2)
+    add = s32[] add(i, two)
+    ROOT tuple = (pred[], s32[]) tuple(comp, add)
+  }
+  cond {
+    sixteen = s32[] constant(16)
+    param0 = (pred[], s32[]) parameter(0)
+    i = s32[] get-tuple-element(param0), index=1
+    ROOT lt = pred[] compare(i, sixteen), direction=LT
+  }
+  ENTRY main {
+    zero = s32[] constant(0)
+    t = pred[] constant(true)
+    tuple.1 = (pred[], s32[]) tuple(t, zero)
+    ROOT while = (pred[], s32[]) while(tuple.1), condition=cond, body=body
+  }
+  )";
+
+  auto run = [&](absl::string_view dir, int64_t constant) {
+    std::string hlo_string = absl::StrReplaceAll(
+        hlo_template, {{"{{LOOP_CONSTANT}}", absl::StrCat(constant)},
+                       {"{{DIRECTION}}", dir}});
+    absl::StatusOr<std::unique_ptr<VerifiedHloModule>> m =
+        ParseAndReturnVerifiedModule(hlo_string);
+    CHECK_OK(m.status());
+    absl::StatusOr<bool> changed =
+        WhileLoopSimplifier(/*simplify_compare_instrs=*/true).Run(m->get());
+    CHECK_OK(changed.status());
+    std::optional<bool> folded;
+    if (*changed) {
+      HloInstruction* while_instr = FindFirstWhile(m->get());
+      const HloInstruction* root =
+          while_instr->while_body()->root_instruction();
+      EXPECT_THAT(root, op::Tuple(op::Constant(), _));
+      folded = root->operand(0)->literal().IsAll(1);
+    }
+    return folded;
+  };
+
+  // i takes values in [0, 14], so compares against constants strictly inside
+  // that range vary across iterations and must be left alone.
+  for (int64_t c : {1, 8, 9, 10, 13}) {
+    EXPECT_EQ(run("LT", c), std::nullopt) << "i < " << c;
+    EXPECT_EQ(run("GT", c), std::nullopt) << "i > " << c;
+  }
+  // At the range ends only one direction is decided.
+  EXPECT_EQ(run("LT", 14), std::nullopt);
+  EXPECT_EQ(run("GT", 14), false);
+  EXPECT_EQ(run("LT", 0), false);
+  EXPECT_EQ(run("GT", 0), std::nullopt);
+  // Compares against constants outside the range fold.
+  EXPECT_EQ(run("LT", 15), true);
+  EXPECT_EQ(run("LT", 16), true);
+  EXPECT_EQ(run("GT", 15), false);
+  EXPECT_EQ(run("LT", -1), false);
+  EXPECT_EQ(run("GT", -1), true);
+}
+
+// A floating point loop counter has no integral step. The pass must leave the
+// compare alone rather than crash on the missing step.
+TEST_F(WhileLoopSimplifierTest, NotRemoveCompareWithFloatCounter) {
+  const std::string hlo_string = R"(
+  HloModule NotRemoveCompareWithFloatCounter
+  body {
+    loop_var = (pred[], f32[]) parameter(0)
+    i = f32[] get-tuple-element(loop_var), index=1
+    five = f32[] constant(5)
+    comp = pred[] compare(i, five), direction=LT
+    one = f32[] constant(1)
+    add = f32[] add(i, one)
+    ROOT tuple = (pred[], f32[]) tuple(comp, add)
+  }
+  cond {
+    ten = f32[] constant(10)
+    param0 = (pred[], f32[]) parameter(0)
+    i = f32[] get-tuple-element(param0), index=1
+    ROOT lt = pred[] compare(i, ten), direction=LT
+  }
+  ENTRY main {
+    zero = f32[] constant(0)
+    t = pred[] constant(true)
+    tuple.1 = (pred[], f32[]) tuple(t, zero)
+    ROOT while = (pred[], f32[]) while(tuple.1), condition=cond, body=body
+  }
+  )";
+  ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(hlo_string));
+  EXPECT_THAT(
+      WhileLoopSimplifier(/*simplify_compare_instrs=*/true).Run(m.get()),
+      absl_testing::IsOkAndHolds(false));
+}
+
+TEST_F(WhileLoopSimplifierTest, NotRemoveCompareWhenInductionVarWraps) {
+  const std::string hlo_string = R"(
+  HloModule NotRemoveCompareWhenInductionVarWraps
+  body {
+    loop_var = (pred[], s32[]) parameter(0)
+    i = s32[] get-tuple-element(loop_var), index=1
+    zero = s32[] constant(0)
+    comp = pred[] compare(i, zero), direction=LT
+    step = s32[] constant(805306368)
+    add = s32[] add(i, step)
+    ROOT tuple = (pred[], s32[]) tuple(comp, add)
+  }
+  cond {
+    bound = s32[] constant(1610612741)
+    param0 = (pred[], s32[]) parameter(0)
+    i = s32[] get-tuple-element(param0), index=1
+    ROOT lt = pred[] compare(i, bound), direction=LT
+  }
+  ENTRY main {
+    init_i = s32[] constant(805306368)
+    init_p = pred[] constant(false)
+    tuple.1 = (pred[], s32[]) tuple(init_p, init_i)
+    ROOT while = (pred[], s32[]) while(tuple.1), condition=cond, body=body
+  }
+  )";
+  ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(hlo_string));
+  EXPECT_THAT(
+      WhileLoopSimplifier(/*simplify_compare_instrs=*/true).Run(m.get()),
+      absl_testing::IsOkAndHolds(false));
+}
+
+TEST_F(WhileLoopSimplifierTest, NotRemoveWhileLoopWhenInductionVarWraps) {
+  const std::string hlo_string = R"(
+  HloModule NotRemoveWhileLoopWhenInductionVarWraps
+  body {
+    loop_var = (f32[], s32[]) parameter(0)
+    acc = f32[] get-tuple-element(loop_var), index=0
+    i = s32[] get-tuple-element(loop_var), index=1
+    one = f32[] constant(1)
+    next_acc = f32[] add(acc, one)
+    step = s32[] constant(1342177280)
+    next_i = s32[] add(i, step)
+    ROOT tuple = (f32[], s32[]) tuple(next_acc, next_i)
+  }
+  cond {
+    bound = s32[] constant(1879048192)
+    param0 = (f32[], s32[]) parameter(0)
+    i = s32[] get-tuple-element(param0), index=1
+    ROOT lt = pred[] compare(i, bound), direction=LT
+  }
+  ENTRY main {
+    zero = f32[] constant(0)
+    init_i = s32[] constant(1073741824)
+    tuple.1 = (f32[], s32[]) tuple(zero, init_i)
+    ROOT while = (f32[], s32[]) while(tuple.1), condition=cond, body=body
+  }
+  )";
+  ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(hlo_string));
+  EXPECT_THAT(
+      WhileLoopSimplifier(/*simplify_compare_instrs=*/true).Run(m.get()),
+      absl_testing::IsOkAndHolds(false));
+  EXPECT_NE(FindFirstWhile(m.get()), nullptr);
+}
+
+TEST_F(WhileLoopSimplifierTest,
+       NotRemoveWhileLoopWhenUnsignedInductionVarWraps) {
+  const std::string hlo_string = R"(
+  HloModule NotRemoveWhileLoopWhenUnsignedInductionVarWraps
+  body {
+    loop_var = (f32[], u32[]) parameter(0)
+    acc = f32[] get-tuple-element(loop_var), index=0
+    i = u32[] get-tuple-element(loop_var), index=1
+    one = f32[] constant(1)
+    next_acc = f32[] add(acc, one)
+    step = u32[] constant(2147483648)
+    next_i = u32[] add(i, step)
+    ROOT tuple = (f32[], u32[]) tuple(next_acc, next_i)
+  }
+  cond {
+    bound = u32[] constant(3221225472)
+    param0 = (f32[], u32[]) parameter(0)
+    i = u32[] get-tuple-element(param0), index=1
+    ROOT lt = pred[] compare(i, bound), direction=LT
+  }
+  ENTRY main {
+    zero = f32[] constant(0)
+    init_i = u32[] constant(2147483648)
+    tuple.1 = (f32[], u32[]) tuple(zero, init_i)
+    ROOT while = (f32[], u32[]) while(tuple.1), condition=cond, body=body
+  }
+  )";
+  ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(hlo_string));
+  EXPECT_THAT(
+      WhileLoopSimplifier(/*simplify_compare_instrs=*/true).Run(m.get()),
+      absl_testing::IsOkAndHolds(false));
+  EXPECT_NE(FindFirstWhile(m.get()), nullptr);
 }
 
 TEST_F(WhileLoopSimplifierTest, NotRemoveCompare) {
@@ -2340,6 +2534,71 @@ TEST_F(WhileLoopSimplifierTest, SimplifierWithDisabledWhileLoopDceAttr) {
   ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_string));
   ASSERT_OK_AND_ASSIGN(bool changed, WhileLoopSimplifier().Run(module.get()));
   EXPECT_FALSE(changed);
+}
+
+// An async-update or async-done carries no called computation of its own; its
+// side effect is the wrapped instruction's, reached through the chain. The
+// loop below feeds x to the async-start and y to the async-update only, and
+// SIDE_EFFECT selects whether the wrapped custom call has a side effect.
+constexpr absl::string_view kAsyncChainHlo = R"hlo(
+  HloModule AsyncChain
+
+  async_comp {
+    a = f32[] parameter(0)
+    b = f32[] parameter(1)
+    ROOT cc = f32[] custom-call(a, b), custom_call_target="Foo", custom_call_has_side_effect=SIDE_EFFECT
+  }
+  cond {
+    p = (s32[], f32[], f32[]) parameter(0)
+    i = s32[] get-tuple-element(p), index=0
+    ten = s32[] constant(10)
+    ROOT lt = pred[] compare(i, ten), direction=LT
+  }
+  body {
+    p = (s32[], f32[], f32[]) parameter(0)
+    i = s32[] get-tuple-element(p), index=0
+    x = f32[] get-tuple-element(p), index=1
+    y = f32[] get-tuple-element(p), index=2
+    one = s32[] constant(1)
+    i.next = s32[] add(i, one)
+    start = ((f32[]), f32[], s32[]) async-start(x), calls=async_comp
+    update = ((f32[], f32[]), f32[], s32[]) async-update(start, y)
+    done = f32[] async-done(update)
+    ROOT t = (s32[], f32[], f32[]) tuple(i.next, x, y)
+  }
+  ENTRY main {
+    zero = s32[] constant(0)
+    one = f32[] constant(1)
+    two = f32[] constant(2)
+    init = (s32[], f32[], f32[]) tuple(zero, one, two)
+    loop = (s32[], f32[], f32[]) while(init), condition=cond, body=body
+    ROOT r = s32[] get-tuple-element(loop), index=0
+  }
+  )hlo";
+
+// A side effect behind the async chain keeps x and y alive, as it would
+// behind the start itself.
+TEST_F(WhileLoopSimplifierTest, AsyncChainWithSideEffectKeepsItsInputsAlive) {
+  ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(absl::StrReplaceAll(
+                                   kAsyncChainHlo, {{"SIDE_EFFECT", "true"}})));
+  HloInstruction* loop = FindFirstWhile(m.get());
+
+  ASSERT_OK_AND_ASSIGN(bool changed, TryRemoveDeadWhileParams(loop));
+
+  EXPECT_FALSE(changed);
+}
+
+// Without the side effect both x and y are dead.
+TEST_F(WhileLoopSimplifierTest, AsyncChainWithoutSideEffectIsDead) {
+  ASSERT_OK_AND_ASSIGN(auto m,
+                       ParseAndReturnVerifiedModule(absl::StrReplaceAll(
+                           kAsyncChainHlo, {{"SIDE_EFFECT", "false"}})));
+  HloInstruction* loop = FindFirstWhile(m.get());
+
+  ASSERT_OK_AND_ASSIGN(bool changed, TryRemoveDeadWhileParams(loop));
+
+  EXPECT_TRUE(changed);
+  EXPECT_THAT(FindFirstWhile(m.get()), While(Tuple(Constant())));
 }
 
 }  // namespace

@@ -28,6 +28,7 @@ limitations under the License.
 #include "absl/algorithm/container.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
@@ -42,6 +43,7 @@ limitations under the License.
 #include "xla/hlo/analysis/alias_info.h"
 #include "xla/hlo/analysis/hlo_alias_analysis.h"
 #include "xla/hlo/analysis/hlo_ordering.h"
+#include "xla/hlo/analysis/hlo_reachability.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
@@ -67,8 +69,25 @@ limitations under the License.
 namespace op = xla::testing::opcode_matchers;
 
 namespace xla {
+
+// Reaches the private interference step so a test can run it on its own.
+class CopyInsertionTestPeer {
+ public:
+  static absl::Status AddCopiesToResolveInterference(
+      CopyInsertion& copy_insertion, HloModule* module) {
+    return copy_insertion.AddCopiesToResolveInterference(
+        module, /*execution_threads=*/{});
+  }
+  static absl::Status OrderPredecessorReadersBeforeInPlaceCopies(
+      CopyInsertion& copy_insertion, HloModule* module) {
+    return copy_insertion.OrderPredecessorReadersBeforeInPlaceCopies(
+        module, /*execution_threads=*/{});
+  }
+};
+
 namespace {
 
+using ::testing::IsEmpty;
 using ::testing::NotNull;
 using ::testing::UnorderedElementsAre;
 
@@ -1167,6 +1186,125 @@ ENTRY %WhileEntry () -> (f32[16], f32[16]) {
   EXPECT_EQ(CountCopies(*module), 1);
 }
 
+// %init_buf reaches the annotated loop twice: directly at index 2 and through
+// the output of %first at index 1, which aliases the init of %first. The
+// duplicate is only visible on the unmodified module: once %first has its init
+// copied, %init_buf no longer shares a buffer with the output of %first.
+constexpr absl::string_view kDuplicateInitBuffersThroughEarlierWhileHlo = R"(
+HloModule DuplicateInitBuffersThroughEarlierWhile
+
+%FirstBody (loop_state: (s32[], f32[16])) -> (s32[], f32[16]) {
+  %loop_state = (s32[], f32[16]) parameter(0)
+  %indvar = s32[] get-tuple-element(%loop_state), index=0
+  %c1 = s32[] constant(1)
+  %next_indvar = s32[] add(%indvar, %c1)
+  %data = f32[16] get-tuple-element(%loop_state), index=1
+  %f1 = f32[] constant(1.0)
+  %c_add = f32[16] broadcast(%f1)
+  %next_data = f32[16] add(%data, %c_add)
+  ROOT %tuple = (s32[], f32[16]) tuple(%next_indvar, %next_data)
+}
+
+%FirstCondition (loop_state: (s32[], f32[16])) -> pred[] {
+  %loop_state = (s32[], f32[16]) parameter(0)
+  %indvar = s32[] get-tuple-element(%loop_state), index=0
+  %limit = s32[] constant(10)
+  ROOT %cmp = pred[] compare(%indvar, %limit), direction=LT
+}
+
+%Body (loop_state: (s32[], f32[16], f32[16])) -> (s32[], f32[16], f32[16]) {
+  %loop_state = (s32[], f32[16], f32[16]) parameter(0)
+  %indvar = s32[] get-tuple-element(%loop_state), index=0
+  %c1 = s32[] constant(1)
+  %next_indvar = s32[] add(%indvar, %c1)
+  %acc1 = f32[16] get-tuple-element(%loop_state), index=1
+  %acc2 = f32[16] get-tuple-element(%loop_state), index=2
+  %f1 = f32[] constant(1.0)
+  %update = f32[4] broadcast(%f1)
+  %c0 = s32[] constant(0)
+  %dus1 = f32[16] dynamic-update-slice(%acc1, %update, %c0),
+      frontend_attributes={xla_disjoint_read_write_regions="true"}
+  %dus2 = f32[16] dynamic-update-slice(%acc2, %update, %c0),
+      frontend_attributes={xla_disjoint_read_write_regions="true"}
+  ROOT %tuple = (s32[], f32[16], f32[16]) tuple(%next_indvar, %dus1, %dus2)
+}
+
+%Condition (loop_state: (s32[], f32[16], f32[16])) -> pred[] {
+  %loop_state = (s32[], f32[16], f32[16]) parameter(0)
+  %indvar = s32[] get-tuple-element(%loop_state), index=0
+  %limit = s32[] constant(10)
+  ROOT %cmp = pred[] compare(%indvar, %limit), direction=LT
+}
+
+ENTRY %WhileEntry () -> (f32[16], f32[16], f32[16]) {
+  %c0 = s32[] constant(0)
+  %indvar_init = s32[] negate(%c0)
+  %zero = f32[] constant(0.0)
+  %init_buf = f32[16] broadcast(%zero)
+  %first_init = (s32[], f32[16]) tuple(%indvar_init, %init_buf)
+  %first = (s32[], f32[16]) while(%first_init),
+                condition=%FirstCondition, body=%FirstBody
+  %first_data = f32[16] get-tuple-element(%first), index=1
+  %init_tuple = (s32[], f32[16], f32[16]) tuple(%indvar_init, %first_data, %init_buf)
+  %while = (s32[], f32[16], f32[16]) while(%init_tuple),
+                condition=%Condition, body=%Body,
+                frontend_attributes={xla_disable_while_loop_copies="true"}
+  %out1 = f32[16] get-tuple-element(%while), index=1
+  %out2 = f32[16] get-tuple-element(%while), index=2
+  ROOT %root = (f32[16], f32[16], f32[16]) tuple(%out1, %out2, %init_buf)
+}
+)";
+
+TEST_F(WhileCopyInsertionTest,
+       DisableWhileLoopCopiesDuplicateInitBuffersThroughEarlierWhile) {
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(
+                           kDuplicateInitBuffersThroughEarlierWhileHlo));
+  InsertCopies(module.get());
+
+  EXPECT_EQ(CountCopies(*module->GetComputationWithName("Body")), 0);
+  // The duplicate at index 2 is copied; %init_buf is live out, so the in-place
+  // update of index 2 could not run on its buffer.
+  const HloInstruction* while_hlo =
+      module->entry_computation()->root_instruction()->operand(0)->operand(0);
+  EXPECT_THAT(while_hlo->operand(0),
+              op::Tuple(op::Negate(), op::GetTupleElement(op::While()),
+                        op::Copy(op::Broadcast())));
+}
+
+// Same module through the interference step alone, so the copy cannot come
+// from the alias analysis that later steps build.
+TEST_F(WhileCopyInsertionTest,
+       DisableWhileLoopCopiesDuplicateInitBuffersInterferenceStepOnly) {
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(
+                           kDuplicateInitBuffersThroughEarlierWhileHlo));
+  CopyInsertion copy_insertion(&alias_info_);
+  ASSERT_OK(CopyInsertionTestPeer::AddCopiesToResolveInterference(
+      copy_insertion, module.get()));
+
+  EXPECT_EQ(CountCopies(*module->GetComputationWithName("Body")), 0);
+  // The step deep copies the init, which leaves get-tuple-element/tuple
+  // rewraps for the tuple simplifier of the full pass; look through them.
+  auto through_rewraps = [](const HloInstruction* instr) {
+    while (instr->opcode() == HloOpcode::kGetTupleElement &&
+           instr->operand(0)->opcode() == HloOpcode::kTuple) {
+      instr = instr->operand(0)->operand(instr->tuple_index());
+    }
+    return instr;
+  };
+  const HloInstruction* while_hlo =
+      module->entry_computation()->root_instruction()->operand(0)->operand(0);
+  const HloInstruction* init = while_hlo->operand(0);
+  ASSERT_EQ(init->opcode(), HloOpcode::kTuple);
+  EXPECT_THAT(through_rewraps(init->operand(0)), op::Negate());
+  EXPECT_THAT(through_rewraps(init->operand(1)),
+              op::GetTupleElement(op::While()));
+  const HloInstruction* copy = through_rewraps(init->operand(2));
+  ASSERT_THAT(copy, op::Copy());
+  EXPECT_THAT(through_rewraps(copy->operand(0)), op::Broadcast());
+}
+
 // Tests Copy Insertion when a while feeds another while
 //                         PARAMETER
 //                        |        |
@@ -1916,7 +2054,8 @@ TEST_F(CopyInsertionTest, SwizzlingWhileDisabledCopies) {
       HloInstruction::CreateTuple({constant1, constant2}));
   auto xla_while = builder.AddInstruction(
       HloInstruction::CreateWhile(loop_state_shape, condition, body, tuple));
-  xla_while->set_frontend_attribute(kXlaDisableWhileLoopCopies, "true");
+  xla_while->set_frontend_attribute(frontend::kXlaDisableWhileLoopCopies,
+                                    "true");
   module->AddEntryComputation(builder.Build());
 
   InsertCopies(module.get());
@@ -3327,6 +3466,44 @@ ENTRY main {
   EXPECT_EQ(CountCopies(*module), 1);
 }
 
+TEST_F(CopyInsertionTest,
+       FusedDynamicUpdateSliceMultiPositionBitcastRequiresCopy) {
+  absl::string_view hlo_string = R"(
+HloModule Module
+
+fused_computation {
+  p0 = f32[8] parameter(0)
+  p1 = f32[8] parameter(1)
+  rev = f32[8] reverse(p1), dimensions={0}
+  slice = f32[3] slice(rev), slice={[0:3]}
+  c0 = s32[] constant(0)
+  ROOT dus = f32[8] dynamic-update-slice(p0, slice, c0)
+}
+
+ENTRY main {
+  param = f32[8] parameter(0)
+  negate = f32[8] negate(param)
+  bc = f32[8] bitcast(negate)
+  ROOT fusion = f32[8] fusion(negate, bc), kind=kLoop, calls=fused_computation
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  InsertCopies(module.get());
+  EXPECT_EQ(CountCopies(*module), 1);
+  EXPECT_THAT(module->entry_computation()->root_instruction(),
+              op::Fusion(op::Copy(op::Negate()), op::Bitcast(op::Negate())));
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> special_case_module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  CopyInsertion copy_insertion(&alias_info_);
+  ASSERT_THAT(copy_insertion.AddSpecialCaseCopies(special_case_module.get()),
+              ::absl_testing::IsOk());
+  EXPECT_EQ(CountCopies(*special_case_module), 1);
+  EXPECT_THAT(special_case_module->entry_computation()->root_instruction(),
+              op::Fusion(op::Negate(), op::Copy(op::Bitcast(op::Negate()))));
+}
+
 TEST_F(CopyInsertionTest, MultiOutputFusedDynamicUpdateSliceCopy) {
   // Tests multi-output fusion with two DUS outputs, requiring two copies.
   absl::string_view hlo_string = R"(
@@ -3447,6 +3624,209 @@ ENTRY main {
   EXPECT_EQ(CountCopies(*module), 1);
   EXPECT_THAT(module->entry_computation()->root_instruction(),
               op::Scatter(op::Copy(op::Iota()), op::Fusion(), op::Iota()));
+}
+
+TEST_F(CopyInsertionTest, InPlaceCopyIsOrderedAfterPredecessorReaders) {
+  // `g` reads the scatter operand and is a predecessor of the scatter, so it
+  // must execute before the scatter anyway. Ordering it before the copy that
+  // is added for the scatter operand lets copy removal prove that the copy is
+  // redundant even when other in-place copies of the same buffer are present,
+  // e.g. for chains of gather-then-scatter updates of a loop-carried table.
+  // `n` also reads the operand but is not a predecessor of the scatter, so it
+  // must not be ordered before the copy.
+  absl::string_view hlo_string = R"(
+HloModule Module
+
+assign {
+  lhs = f32[] parameter(0)
+  ROOT rhs = f32[] parameter(1)
+}
+
+ENTRY main {
+  t = f32[8,4] parameter(0)
+  idx = s32[2,1] parameter(1)
+  upd = f32[2,4] parameter(2)
+  g = f32[2,4] gather(t, idx), offset_dims={1}, collapsed_slice_dims={0},
+      start_index_map={0}, index_vector_dim=1, slice_sizes={1,4}
+  new_rows = f32[2,4] add(g, upd)
+  n = f32[8,4] negate(t)
+  t_next = f32[8,4] scatter(t, idx, new_rows), update_window_dims={1},
+      inserted_window_dims={0}, scatter_dims_to_operand_dims={0},
+      index_vector_dim=1, to_apply=assign
+  ROOT out = (f32[8,4], f32[8,4]) tuple(t_next, n)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  CopyInsertion copy_insertion(&alias_info_);
+  copy_insertion.set_order_predecessor_readers_before_in_place_copies(true);
+  ASSERT_OK(CopyInsertionTestPeer::AddCopiesToResolveInterference(
+      copy_insertion, module.get()));
+  ASSERT_OK(CopyInsertionTestPeer::OrderPredecessorReadersBeforeInPlaceCopies(
+      copy_insertion, module.get()));
+
+  HloComputation* entry = module->entry_computation();
+  const HloInstruction* scatter = entry->GetInstructionWithName("t_next");
+  ASSERT_THAT(scatter, op::Scatter(op::Copy(op::Parameter(0)), op::Parameter(1),
+                                   op::Add()));
+  EXPECT_THAT(scatter->operand(0)->control_predecessors(),
+              UnorderedElementsAre(entry->GetInstructionWithName("g")));
+}
+
+TEST_F(CopyInsertionTest, ReaderStaysOrderedBeforeInPlaceOpAfterCopyRemoval) {
+  // `reader` reaches the in-place `t_next` only through `tup`, which
+  // TupleSimplifier removes before copy removal. `t_next` overwrites `t` in
+  // place, so either the copy of `t` is kept, or `reader` must still be
+  // ordered before `t_next`.
+  absl::string_view hlo_string = R"(
+HloModule Module
+
+ENTRY main {
+  p0 = f32[16,128] parameter(0)
+  upd = f32[1,128] parameter(1)
+  idx = s32[] parameter(2)
+  c0 = s32[] constant(0)
+  t = f32[16,128] add(p0, p0)
+  reader = f32[16,128] negate(t)
+  tup = (s32[], f32[16,128]) tuple(idx, reader)
+  idx_gte = s32[] get-tuple-element(tup), index=0
+  out_reader = f32[16,128] get-tuple-element(tup), index=1
+  t_next = f32[16,128] dynamic-update-slice(t, upd, idx_gte, c0)
+  ROOT out = (f32[16,128], f32[16,128]) tuple(t_next, out_reader)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  CopyInsertion copy_insertion(&alias_info_);
+  copy_insertion.set_order_predecessor_readers_before_in_place_copies(true);
+  ASSERT_OK(copy_insertion.Run(module.get()).status());
+
+  HloComputation* entry = module->entry_computation();
+  const HloInstruction* reader = entry->GetInstructionWithName("reader");
+  const HloInstruction* t_next = entry->GetInstructionWithName("t_next");
+  EXPECT_TRUE(t_next->operand(0)->opcode() == HloOpcode::kCopy ||
+              HloReachabilityMap::Build(entry)->IsReachable(reader, t_next))
+      << module->ToString();
+}
+
+TEST_F(CopyInsertionTest, AsyncStartIsNotOrderedBeforeInPlaceCopy) {
+  // `start` reads `t` until `done`, so ordering `start` before the copy added
+  // for the in-place `t_next` would not order the read.
+  absl::string_view hlo_string = R"(
+HloModule Module
+
+async_comp {
+  p = f32[16,128] parameter(0)
+  ROOT n = f32[16,128] negate(p)
+}
+
+ENTRY main {
+  p0 = f32[16,128] parameter(0)
+  idx = s32[] parameter(1)
+  c0 = s32[] constant(0)
+  t = f32[16,128] add(p0, p0)
+  start = ((f32[16,128]), f32[16,128], s32[]) async-start(t), calls=async_comp
+  done = f32[16,128] async-done(start)
+  upd = f32[1,128] slice(done), slice={[0:1], [0:128]}
+  ROOT t_next = f32[16,128] dynamic-update-slice(t, upd, idx, c0)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  CopyInsertion copy_insertion(&alias_info_);
+  copy_insertion.set_order_predecessor_readers_before_in_place_copies(true);
+  ASSERT_OK(CopyInsertionTestPeer::AddCopiesToResolveInterference(
+      copy_insertion, module.get()));
+  ASSERT_OK(CopyInsertionTestPeer::OrderPredecessorReadersBeforeInPlaceCopies(
+      copy_insertion, module.get()));
+
+  const HloInstruction* t_next =
+      module->entry_computation()->GetInstructionWithName("t_next");
+  ASSERT_THAT(t_next, op::DynamicUpdateSlice(op::Copy(op::Add()), op::Slice(),
+                                             op::Parameter(1), op::Constant()));
+  EXPECT_THAT(t_next->operand(0)->control_predecessors(), IsEmpty());
+}
+
+TEST_F(CopyInsertionTest, InPlaceCopiesOfSharedOperandAreNotChained) {
+  // Both scatters update their own copy of `b`. The copy added for the second
+  // scatter must not be ordered after the copy added for the first one: the
+  // copies are not removable either way, so the edge would only constrain the
+  // schedule.
+  absl::string_view hlo_string = R"(
+HloModule Module
+
+assign {
+  lhs = f32[] parameter(0)
+  ROOT rhs = f32[] parameter(1)
+}
+
+ENTRY main {
+  zero = f32[] constant(0)
+  b = f32[8,4] broadcast(zero), dimensions={}
+  idx = s32[2,1] parameter(0)
+  upd = f32[2,4] parameter(1)
+  t0 = f32[8,4] scatter(b, idx, upd), update_window_dims={1},
+      inserted_window_dims={0}, scatter_dims_to_operand_dims={0},
+      index_vector_dim=1, to_apply=assign
+  g = f32[2,4] gather(t0, idx), offset_dims={1}, collapsed_slice_dims={0},
+      start_index_map={0}, index_vector_dim=1, slice_sizes={1,4}
+  t1 = f32[8,4] scatter(b, idx, g), update_window_dims={1},
+      inserted_window_dims={0}, scatter_dims_to_operand_dims={0},
+      index_vector_dim=1, to_apply=assign
+  ROOT out = (f32[8,4], f32[8,4]) tuple(t0, t1)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  CopyInsertion copy_insertion(&alias_info_);
+  copy_insertion.set_order_predecessor_readers_before_in_place_copies(true);
+  ASSERT_OK(CopyInsertionTestPeer::AddCopiesToResolveInterference(
+      copy_insertion, module.get()));
+  ASSERT_OK(CopyInsertionTestPeer::OrderPredecessorReadersBeforeInPlaceCopies(
+      copy_insertion, module.get()));
+
+  HloComputation* entry = module->entry_computation();
+  for (absl::string_view name : {"t0", "t1"}) {
+    const HloInstruction* scatter = entry->GetInstructionWithName(name);
+    ASSERT_THAT(scatter, op::Scatter(op::Copy(op::Broadcast()),
+                                     op::Parameter(0), ::testing::_))
+        << name;
+    EXPECT_THAT(scatter->operand(0)->control_predecessors(), IsEmpty()) << name;
+  }
+}
+
+TEST_F(CopyInsertionTest, InPlaceCopyIsNotOrderedAfterReadersByDefault) {
+  absl::string_view hlo_string = R"(
+HloModule Module
+
+assign {
+  lhs = f32[] parameter(0)
+  ROOT rhs = f32[] parameter(1)
+}
+
+ENTRY main {
+  t = f32[8,4] parameter(0)
+  idx = s32[2,1] parameter(1)
+  upd = f32[2,4] parameter(2)
+  g = f32[2,4] gather(t, idx), offset_dims={1}, collapsed_slice_dims={0},
+      start_index_map={0}, index_vector_dim=1, slice_sizes={1,4}
+  new_rows = f32[2,4] add(g, upd)
+  ROOT t_next = f32[8,4] scatter(t, idx, new_rows), update_window_dims={1},
+      inserted_window_dims={0}, scatter_dims_to_operand_dims={0},
+      index_vector_dim=1, to_apply=assign
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  CopyInsertion copy_insertion(&alias_info_);
+  ASSERT_OK(CopyInsertionTestPeer::AddCopiesToResolveInterference(
+      copy_insertion, module.get()));
+
+  const HloInstruction* scatter =
+      module->entry_computation()->GetInstructionWithName("t_next");
+  ASSERT_THAT(scatter, op::Scatter(op::Copy(op::Parameter(0)), op::Parameter(1),
+                                   op::Add()));
+  EXPECT_THAT(scatter->operand(0)->control_predecessors(), IsEmpty());
 }
 
 TEST_F(CopyInsertionTest, VariadicScatterSharedOperand) {
@@ -6003,6 +6383,156 @@ ENTRY main {
   for (const HloInstruction* instr : while_body->instructions()) {
     EXPECT_NE(instr->opcode(), HloOpcode::kCopy);
   }
+}
+
+TEST_F(CopyInsertionTest,
+       ConditionalBranchMustCopyWhenOperandReadAfterConditional) {
+  absl::string_view hlo_string = R"(
+HloModule ConditionalOperandReadAfter
+
+branch_0 {
+  p0 = (f32[4]) parameter(0)
+  v0 = f32[4] get-tuple-element(p0), index=0
+  bar = f32[4] opt-barrier(v0)
+  ROOT r0 = (f32[4]) tuple(bar)
+}
+
+branch_1 {
+  p1 = (f32[4]) parameter(0)
+  v1 = f32[4] get-tuple-element(p1), index=0
+  neg = f32[4] negate(v1)
+  ROOT r1 = (f32[4]) tuple(neg)
+}
+
+ENTRY main {
+  cond_pred = pred[] parameter(0)
+  x = f32[4] parameter(1)
+  e = f32[4] negate(x)
+  t = (f32[4]) tuple(e)
+  cond = (f32[4]) conditional(cond_pred, t, t),
+    true_computation=branch_0, false_computation=branch_1
+  k = f32[4] get-tuple-element(cond), index=0
+  ROOT out = f32[4] add(e, k)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  CopyInsertion copy_insertion(&alias_info_,
+                               /*use_region_based_live_range_analysis=*/-1);
+  ASSERT_THAT(copy_insertion.Run(module.get()), ::absl_testing::IsOk());
+
+  HloComputation* branch_0 = module->GetComputationWithName("branch_0");
+  HloComputation* branch_1 = module->GetComputationWithName("branch_1");
+  ASSERT_NE(branch_0, nullptr);
+  ASSERT_NE(branch_1, nullptr);
+  EXPECT_EQ(CountCopies(*branch_0), 1);
+  EXPECT_EQ(CountCopies(*branch_1), 0);
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloAliasAnalysis> alias_analysis,
+                       HloAliasAnalysis::Run(module.get(), &alias_info_));
+  const HloInstruction* e = FindInstruction(module.get(), "e");
+  const HloInstruction* cond = FindInstruction(module.get(), "cond");
+  ASSERT_NE(e, nullptr);
+  ASSERT_NE(cond, nullptr);
+  EXPECT_NE(&alias_analysis->GetUniqueBufferAt(e),
+            &alias_analysis->GetUniqueBufferAt(cond, {0}));
+}
+
+TEST_F(CopyInsertionTest,
+       ConditionalAllPassthroughBranchesElideCopiesWhenOperandReadAfter) {
+  // Both branches pass `e` through unchanged via a tuple parameter and GTE, and
+  // `e` is also read after the conditional. Because the GTE operand (`p0`/`p1`)
+  // is a kParameter, it is not in `src_live_range`, whereas the inserted branch
+  // root copies themselves are recorded as users in `src_live_range`. Checking
+  // `region.contains(instr)` (without requiring `region.contains(operand)`)
+  // allows both branch copies to be elided.
+  absl::string_view hlo_string = R"(
+HloModule ConditionalAllPassthroughOperandReadAfter
+
+branch_0 {
+  p0 = (f32[4]) parameter(0)
+  v0 = f32[4] get-tuple-element(p0), index=0
+  ROOT r0 = (f32[4]) tuple(v0)
+}
+
+branch_1 {
+  p1 = (f32[4]) parameter(0)
+  v1 = f32[4] get-tuple-element(p1), index=0
+  ROOT r1 = (f32[4]) tuple(v1)
+}
+
+ENTRY main {
+  cond_pred = pred[] parameter(0)
+  x = f32[4] parameter(1)
+  e = f32[4] negate(x)
+  t = (f32[4]) tuple(e)
+  cond = (f32[4]) conditional(cond_pred, t, t),
+    true_computation=branch_0, false_computation=branch_1
+  k = f32[4] get-tuple-element(cond), index=0
+  ROOT out = f32[4] add(e, k)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  CopyInsertion copy_insertion(&alias_info_,
+                               /*use_region_based_live_range_analysis=*/-1);
+  ASSERT_THAT(copy_insertion.Run(module.get()), ::absl_testing::IsOk());
+
+  EXPECT_EQ(CountCopies(*module), 0);
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloAliasAnalysis> alias_analysis,
+                       HloAliasAnalysis::Run(module.get(), &alias_info_));
+  const HloInstruction* e = FindInstruction(module.get(), "e");
+  const HloInstruction* cond = FindInstruction(module.get(), "cond");
+  ASSERT_NE(e, nullptr);
+  ASSERT_NE(cond, nullptr);
+  EXPECT_EQ(&alias_analysis->GetUniqueBufferAt(e),
+            &alias_analysis->GetUniqueBufferAt(cond, {0}));
+}
+
+TEST_F(CopyInsertionTest, DoesNotInsertCopiesInsideNestedFusionComputation) {
+  constexpr absl::string_view kHlo = R"(
+HloModule NestedFusionNoInternalCopy
+
+dus_stage {
+  p0 = s32[4,4] parameter(0)
+  slice = s32[1,1] slice(p0), slice={[0:1], [0:1]}
+  one = s32[1,1] constant({{1}})
+  add = s32[1,1] add(slice, one)
+  c1 = s32[] constant(1)
+  c0 = s32[] constant(0)
+  ROOT dus = s32[4,4] dynamic-update-slice(p0, add, c1, c0)
+}
+
+transpose_stage {
+  p0 = s32[4,4] parameter(0)
+  ROOT tr = s32[4,4] transpose(p0), dimensions={1,0}
+}
+
+outer_fusion_comp {
+  outer_p0 = s32[4,4] parameter(0)
+  stage_0 = s32[4,4] fusion(outer_p0), kind=kLoop, calls=dus_stage
+  stage_1 = s32[4,4] fusion(stage_0), kind=kLoop, calls=transpose_stage
+  ROOT out = (s32[4,4], s32[4,4]) tuple(stage_0, stage_1)
+}
+
+ENTRY main {
+  p0 = s32[4,4] parameter(0)
+  fused = (s32[4,4], s32[4,4]) fusion(p0), kind=kCustom, calls=outer_fusion_comp
+  gte_0 = s32[4,4] get-tuple-element(fused), index=0
+  gte_1 = s32[4,4] get-tuple-element(fused), index=1
+  ROOT root = (s32[4,4], s32[4,4]) tuple(gte_1, gte_0)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  InsertCopies(module.get());
+
+  HloComputation* outer_fusion_comp =
+      module->GetComputationWithName("outer_fusion_comp");
+  ASSERT_NE(outer_fusion_comp, nullptr);
+  EXPECT_EQ(CountCopies(*outer_fusion_comp), 0);
+  EXPECT_GT(CountCopies(*module->entry_computation()), 0);
 }
 
 INSTANTIATE_TEST_SUITE_P(CondOrder, CopyInsertionCondOrderTest,

@@ -16,12 +16,15 @@ limitations under the License.
 #ifndef TENSORFLOW_CORE_TFRT_IFRT_IFRT_SERVING_EXECUTABLE_TEST_UTIL_H_
 #define TENSORFLOW_CORE_TFRT_IFRT_IFRT_SERVING_EXECUTABLE_TEST_UTIL_H_
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
 
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "mlir/IR/DialectRegistry.h"  // from @llvm-project
 #include "mlir/IR/MLIRContext.h"  // from @llvm-project
 #include "tensorflow/compiler/mlir/tfrt/transforms/ifrt/tf2hlo.h"
@@ -51,9 +54,13 @@ class IfrtServingExecutableTestHelper {
 
   // Creates an IfrtServingExecutable with the given program id.
   // Note the instance of this class must outlive the returned
-  // IfrtServingExecutable.
+  // IfrtServingExecutable. If assigned_device_ids is not empty, the executable
+  // will be pinned to the given devices.
   std::unique_ptr<IfrtServingExecutable> MakeExecutable(
       int64_t program_id, std::string mlir_module_path);
+  absl::StatusOr<std::unique_ptr<IfrtServingExecutable>> MakeExecutable(
+      int64_t program_id, std::string mlir_module_path,
+      absl::Span<const int> assigned_device_ids);
 
   void SetH2DTransferExecutorFactory(
       std::unique_ptr<H2DTransferExecutorFactory> factory) {
@@ -64,9 +71,32 @@ class IfrtServingExecutableTestHelper {
     return &ifrt_restore_tensor_registry_;
   }
 
+  xla::ifrt::Client* client() const { return client_.get(); }
+
   int num_cores() const { return client_->addressable_device_count(); }
 
+  // Simulates XLA compilation being disabled (e.g. by
+  // `ScopedTpuCompileDisabler`) for executables created by this helper.
+  void SetXlaCompilationDisabled(bool disabled) {
+    tf_to_hlo_compiler_.set_xla_compilation_disabled(disabled);
+  }
+
  private:
+  // A `TfToHloCompiler` whose `IsXlaCompilationDisabled()` can be controlled
+  // by tests.
+  class TestTfToHloCompiler : public TfToHloCompiler {
+   public:
+    bool IsXlaCompilationDisabled() const override {
+      return xla_compilation_disabled_.load();
+    }
+    void set_xla_compilation_disabled(bool disabled) {
+      xla_compilation_disabled_.store(disabled);
+    }
+
+   private:
+    std::atomic<bool> xla_compilation_disabled_ = false;
+  };
+
   static constexpr int kThreadPoolNumThreads = 16;
 
   tsl::test_util::MockServingDeviceSelector* device_selector_;  // Not owned.
@@ -82,7 +112,7 @@ class IfrtServingExecutableTestHelper {
   std::unique_ptr<mlir::MLIRContext> context_;
   std::unique_ptr<IfrtPersistentCompilationCache>
       ifrt_persistent_compilation_cache_;
-  TfToHloCompiler tf_to_hlo_compiler_;
+  TestTfToHloCompiler tf_to_hlo_compiler_;
   std::unique_ptr<H2DTransferExecutorFactory> h2d_transfer_executor_factory_;
 };
 

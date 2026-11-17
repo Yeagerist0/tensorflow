@@ -21,7 +21,6 @@ include "mlir/Dialect/Arith/IR/ArithOps.td"
 include "mlir/Dialect/Func/IR/FuncOps.td"
 include "tensorflow/compiler/mlir/lite/ir/tfl_ops.td"
 include "tensorflow/compiler/mlir/lite/utils/utils.td"
-include "tensorflow/compiler/mlir/tensorflow/ir/tf_ops.td"
 include "tensorflow/compiler/mlir/lite/ir/tfl_op_enums.td"
 include "mlir/IR/CommonAttrConstraints.td"
 
@@ -987,11 +986,6 @@ def MatchPRelu : Pat<
    (HasOneUse $mul_out),
    (HasOneUse $input_neg_out)]>;
 
-// The constant folding in this pass might produce constant in the tf dialect.
-// This rule is to legalize these constant to the tfl dialect.
-def LegalizeConstOp : Pat<
-  (TF_ConstOp ElementsAttr:$value), (TFL_ConstOp $value)>;
-
 // Reorders adds to allow constant folding.
 // Add --> Add $input, $constantA
 //    \--> $constantB
@@ -1384,11 +1378,10 @@ def FuseOneHotAndCastToFloat : Pat<
                 $axis),
   [(F32ElementsVal $output)]>;
 
-def Get1DShapeValue: NativeCodeCall<"Get1DShapeValue($_builder, $0)">;
-
 class GetIthValue<int index> : NativeCodeCall<"$0[" # index # "]">;
 
-def GetEmbeddingLookupShape: NativeCodeCall<"GetEmbeddingLookupShape($0, $1)">;
+def BuildOneHotLookup : NativeCodeCall<
+  "BuildOneHotLookup($_builder, $0[0], $1, $2)">;
 
 // Replace
 //   OneHot(index, depth, on=1.0f, off=0.0f, axis=-1) * filter
@@ -1410,6 +1403,11 @@ def GetEmbeddingLookupShape: NativeCodeCall<"GetEmbeddingLookupShape($0, $1)">;
 //             [11, 23]]   # == 2nd column in filter
 // This is exactly what the EmbeddedLookup operator is doing, on the transposed
 // matrix, without doing any arithmetic but only memcpy.
+//
+// OneHot produces an all-zero row for an index outside `[0, depth)` (e.g. -1
+// padding), while EmbeddingLookup rejects it. The replacement therefore clamps
+// the indices for the lookup and zeroes the rows of out-of-range indices; see
+// BuildOneHotLookup.
 def ReplaceOneHotFullyConnectedWithLookup : Pat<
   (TFL_FullyConnectedOp:$outputs
     (TFL_OneHotOp
@@ -1424,15 +1422,7 @@ def ReplaceOneHotFullyConnectedWithLookup : Pat<
     TFL_FCWO_Default,
     $keep_num_dims,
     $asymmetric_quantize_inputs),
-  (TFL_ReshapeOp
-  (TFL_EmbeddingLookupOp
-      (TFL_ReshapeOp $indices, (Get1DShapeValue $indices)),
-    (TFL_TransposeOp
-      $filter,
-        (Arith_ConstantOp ConstantAttr<RankedI32ElementsAttr<[2]>, "{1,0}">)),
-      (returnType (GetEmbeddingLookupShape $indices, $filter))
-    ),
-    (Arith_ConstantOp (GetShapeAttr (GetIthValue<0> $outputs)))),
+  (BuildOneHotLookup $outputs, $indices, $filter),
   [(I32ElementsVal $indices),     // lookup is not implemented for i64
    (IsNoneType $bias)]>;          // Maybe folded into the lookup matrix later
 
@@ -1451,10 +1441,7 @@ def ReplaceOneHotDynamicShapeFullyConnectedWithLookup : Pat<
     TFL_FCWO_Default,
     $keep_num_dims,
     $asymmetric_quantize_inputs),
-  (TFL_EmbeddingLookupOp $indices,
-    (TFL_TransposeOp
-      $filter,
-        (Arith_ConstantOp ConstantAttr<RankedI32ElementsAttr<[2]>, "{1,0}">))),
+  (BuildOneHotLookup $outputs, $indices, $filter),
   [(I32ElementsVal $indices),
    (IsNoneType $bias)]>;
 
@@ -1723,41 +1710,11 @@ def MatchGeluApproximate1_Mul3 : Pat<
    (HasOneUse $mul_out4),
   ]>;
 
-// For Gelu, replaces
-//   0.5 * x * ( 1 + erf( x * sqrt_1_2 ) )
-def MatchGelu : Pat<
-  (TFL_MulOp
-   (TFL_MulOp:$mul_out $arg0, (Arith_ConstantOp F32ElementsAttr:$Cst_1_2), TFL_AF_None),
-   (TFL_AddOp:$add_out
-    (TF_ErfOp:$erf_out
-     (TFL_MulOp:$mul_out1 $arg0, (Arith_ConstantOp F32ElementsAttr:$Cst_sqrt_1_2), TFL_AF_None)),
-    (Arith_ConstantOp  F32ElementsAttr:$Cst_1), TFL_AF_None), TFL_AF_None),
-  (TFL_GeluOp $arg0, ConstBoolAttrFalse),
-  [(FloatValueEquals<"0.5"> $Cst_1_2),
-   (FloatValueEquals<"1"> $Cst_1),
-   (FloatValueEquals<"0.707106769"> $Cst_sqrt_1_2),
-   (HasOneUse $mul_out),
-   (HasOneUse $add_out),
-   (HasOneUse $erf_out),
-   (HasOneUse $mul_out1),
-  ]>;
-
-// For Gelu, replaces
-//   0.5 * x * ( erfc( -x * sqrt_1_2 ) )
-def MatchGeluWithErfc : Pat<
-  (TFL_MulOp
-   (TFL_MulOp:$mul_out $arg0, (Arith_ConstantOp F32ElementsAttr:$Cst_1_2), TFL_AF_None),
-   (TF_ErfcOp:$erfc_out
-    (TFL_MulOp:$mul_out1
-     (TFL_NegOp $arg0),
-     (Arith_ConstantOp F32ElementsAttr:$Cst_sqrt_1_2), TFL_AF_None)), TFL_AF_None),
-  (TFL_GeluOp $arg0, ConstBoolAttrFalse),
-  [(FloatValueEquals<"0.5"> $Cst_1_2),
-   (FloatValueEquals<"0.707106769"> $Cst_sqrt_1_2),
-   (HasOneUse $mul_out),
-   (HasOneUse $erfc_out),
-   (HasOneUse $mul_out1),
-  ]>;
+// The patterns that match TF ops left by the TensorFlow lowering
+// (`MatchGeluWithTFErf` / `MatchGeluWithTFErfc` for GELU with `tf.Erf` /
+// `tf.Erfc`, and `LegalizeTFConstOp` for `tf.Const`) are written in C++ in
+// optimize_pass.cc and match the TF ops by name, so that this pass does not
+// depend on the TF dialect.
 
 // Fetches the output of FC op, from the provided arguments.
 def GetFcOutput : NativeCodeCall<
@@ -1796,20 +1753,51 @@ def SimplifyDoubleSelectFCZerosRHS : Pat<
    (AllValuesAreZero $zeros_2)
   ]>;
 
+// 1 / (1 + exp(-x)) -> logistic(x), in float32 or float16.
 def FuseSigmoid : Pat<
-  (TFL_DivOp
-   (Arith_ConstantOp F32ElementsAttr:$ones),
+  (TFL_DivOp:$div_out
+   (Arith_ConstantOp FloatElementsAttr:$ones),
    (TFL_AddOp:$add_out
     (TFL_ExpOp:$exp_out
-     (TFL_NegOp:$neg_out $arg)),
-    (Arith_ConstantOp F32ElementsAttr:$ones_1), TFL_AF_None), TFL_AF_None),
+     (TFL_NegOp:$neg_out TensorOf<[F32, F16]>:$arg)),
+    (Arith_ConstantOp FloatElementsAttr:$ones_1), TFL_AF_None), TFL_AF_None),
   (TFL_LogisticOp $arg),
   [(FloatValueEquals<"1"> $ones_1),
    (FloatValueEquals<"1"> $ones),
+   (HasSameType $arg, $div_out),
    (HasOneUse $neg_out),
    (HasOneUse $add_out),
    (HasOneUse $exp_out),
   ]>;
+
+// The overflow-free sigmoid that JAX lowers `jax.nn.sigmoid` to for float16
+// (and for float32 on GPU or with `accuracy=HIGHEST`):
+//   e = exp(-|x|); select(x >= 0, 1, e) / (1 + e) -> logistic(x).
+foreach SelectOp = [TFL_SelectOp, TFL_SelectV2Op] in {
+  def FuseNumericallyStableSigmoid#SelectOp : Pat<
+    (TFL_DivOp:$div_out
+     (SelectOp:$select_out
+      (TFL_GreaterEqualOp $arg, (Arith_ConstantOp FloatElementsAttr:$zero)),
+      (Arith_ConstantOp FloatElementsAttr:$ones),
+      (TFL_ExpOp:$exp_out
+       (TFL_NegOp:$neg_out
+        (TFL_AbsOp:$abs_out TensorOf<[F32, F16]>:$arg)))),
+     (TFL_AddOp:$add_out
+      $add_lhs, (Arith_ConstantOp FloatElementsAttr:$ones_1), TFL_AF_None),
+     TFL_AF_None),
+    (TFL_LogisticOp $arg),
+    [(FloatValueEquals<"0"> $zero),
+     (FloatValueEquals<"1"> $ones),
+     (FloatValueEquals<"1"> $ones_1),
+     (IsSame $exp_out, $add_lhs),
+     (HasSameType $arg, $div_out),
+     (HasOneUse $abs_out),
+     (HasOneUse $neg_out),
+     (HasTwoUse $exp_out),
+     (HasOneUse $select_out),
+     (HasOneUse $add_out),
+    ]>;
+}
 
 def FuseEluConst : Pat<
   (TFL_SelectOp

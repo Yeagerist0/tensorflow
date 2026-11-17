@@ -31,7 +31,7 @@ NVIDIA_GPU_BACKENDS = [
     "b200",
     "gb200",
     "gb300",
-    "vr200",
+    "vr_nvl72",
 ] + if_google([], ["rtx6000pro"])
 
 # The generic "gpu" backend includes the actual backends in this list.
@@ -42,7 +42,7 @@ NVIDIA_GPU_DEFAULT_BACKENDS = [
     "b200",
     "gb200",
     "gb300",
-    "vr200",
+    "vr_nvl72",
 ] + if_google([], ["rtx6000pro"])
 
 AMD_GPU_DEFAULT_BACKENDS = ["amdgpu_any"]
@@ -92,7 +92,7 @@ def prepare_nvidia_gpu_backend_data(backends, disabled_backends, backend_tags, b
         "b200": (10, 0),
         "gb200": (10, 0),
         "gb300": (10, 3),
-        "vr200": (10, 7),
+        "vr_nvl72": (10, 7),
         "rtx6000pro": (12, 0),
     }
     for gpu_backend in NVIDIA_GPU_BACKENDS:
@@ -128,7 +128,7 @@ def prepare_nvidia_gpu_backend_data(backends, disabled_backends, backend_tags, b
         else:
             sm_major, sm_minor = sm_requirements[gpu_backend]
             full = "-full" if requires_full_gpu else ""
-            sm_tag = "requires-gpu-nvidia" if sm_major == 0 else "requires-gpu-sm%s%s%s-only" % (sm_major, sm_minor, full)
+            sm_tag = if_google("requires-gpu-sm90", "requires-gpu-nvidia") if sm_major == 0 else "requires-gpu-sm%s%s%s-only" % (sm_major, sm_minor, full)
             if num_gpus:
                 sm_tag += ":%d" % num_gpus
             new_backend_tags[gpu_backend] = [t for t in all_tags if t not in requires_gpu]

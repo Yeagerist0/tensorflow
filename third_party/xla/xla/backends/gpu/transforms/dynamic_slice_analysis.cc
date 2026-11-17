@@ -41,6 +41,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/literal.h"
 #include "xla/literal_util.h"
+#include "xla/overflow_util.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/pattern_matcher.h"
 #include "xla/shape.h"
@@ -264,37 +265,51 @@ struct InitStep {
   int64_t step;
 };
 
-static InitStep GetInitStepForVariable(const HloInstruction* variable,
-                                       const WhileLoopBackendConfig& config) {
-  InitStep init_step{config.known_init_step().init(),
-                     config.known_init_step().step()};
-
-  if (variable->opcode() != HloOpcode::kGetTupleElement) {
-    return init_step;
-  }
-
-  int64_t tuple_idx = variable->tuple_index();
-  for (const auto& dynamic_variable : config.dynamic_variables()) {
-    if (dynamic_variable.tuple_index() != tuple_idx) {
-      continue;
-    }
-    if (dynamic_variable.has_init()) {
-      init_step.init = dynamic_variable.init();
-    }
-    if (dynamic_variable.has_step()) {
-      init_step.step = dynamic_variable.step();
-    }
-    break;
-  }
-
-  return init_step;
-}
-
 static const HloInstruction* StripCopies(const HloInstruction* instr) {
   while (instr->opcode() == HloOpcode::kCopy) {
     instr = instr->operand(0);
   }
   return instr;
+}
+
+// Returns the affine init/step of `variable`, a GTE of the loop parameter
+// (possibly through copies), or nullopt if they are not known.
+//
+// The induction variable uses `known_init_step`, which is authoritative (the
+// HloVerifier rejects a `dynamic_variables` entry that contradicts it). Any
+// other loop-carried variable needs both init and step in its
+// `dynamic_variables` entry. Such a variable is not equal to the induction
+// variable in general (e.g. CollectivePipeliner's prefetch counters, whose init
+// is computed by a peeled iteration), so substituting the induction variable's
+// init/step would compute offsets for the wrong iteration.
+static std::optional<InitStep> GetInitStepForVariable(
+    const HloInstruction* variable, const WhileLoopBackendConfig& config) {
+  const HloInstruction* gte = StripCopies(variable);
+  if (gte->opcode() != HloOpcode::kGetTupleElement) {
+    VLOG(5) << "Variable " << variable->name() << " is not a GTE.";
+    return std::nullopt;
+  }
+  int64_t tuple_idx = gte->tuple_index();
+  if (config.has_known_induction_variable() && config.has_known_init_step() &&
+      config.known_induction_variable().tuple_index() == tuple_idx) {
+    return InitStep{config.known_init_step().init(),
+                    config.known_init_step().step()};
+  }
+
+  const WhileLoopBackendConfig::DynamicVariable* entry = nullptr;
+  for (const auto& dynamic_variable : config.dynamic_variables()) {
+    if (dynamic_variable.tuple_index() == tuple_idx) {
+      entry = &dynamic_variable;
+      break;
+    }
+  }
+
+  if (entry == nullptr || !entry->has_init() || !entry->has_step()) {
+    VLOG(5) << "Variable at tuple index " << tuple_idx
+            << " has unknown init/step.";
+    return std::nullopt;
+  }
+  return InitStep{entry->init(), entry->step()};
 }
 
 static std::optional<StaggeredVariable> TryResolveStaggeredVariable(
@@ -354,9 +369,15 @@ static std::optional<StaggeredVariable> TryResolveStaggeredVariable(
   }
 
   // Step 5: Read the staggered slot's initial value from the while loop's
-  // init tuple. It must be a constant (possibly through copies) so we can
-  // compute the offset formula. Typically this is (init - step), e.g. 0 when
-  // init=1, step=1.
+  // init tuple. It must be a constant (possibly through copies) equal to
+  // (init - step) of the induction variable, e.g. 0 when init=1, step=1.
+  //
+  // By Step 4, the slot holds its initial value in iteration 0 and the
+  // induction variable of iteration k-1, init + (k-1)*step, in iteration
+  // k >= 1. The caller describes the slot as init_value + k*step for every
+  // iteration, which matches iterations k >= 1 only when
+  // init_value == init - step. Any other initial value would make every
+  // offset after the first wrong while still looking linear, so reject it.
   if (!Match(while_loop->operand(0), m::Tuple()) ||
       staggered_index >= while_loop->operand(0)->operand_count()) {
     return std::nullopt;
@@ -370,6 +391,19 @@ static std::optional<StaggeredVariable> TryResolveStaggeredVariable(
   if (!init_value) {
     return std::nullopt;
   }
+  // Check `init_value + step == init` rather than computing `init - step`: the
+  // backend config fields are unvalidated, so the subtraction could overflow.
+  std::optional<int64_t> reconstructed_init =
+      OverflowSafeAdd(*init_value, config->known_init_step().step());
+  if (!reconstructed_init ||
+      *reconstructed_init != config->known_init_step().init()) {
+    VLOG(5) << "Staggered slot " << staggered_index << " of "
+            << while_loop->name() << " starts at " << *init_value
+            << " which is not init - step for init="
+            << config->known_init_step().init()
+            << ", step=" << config->known_init_step().step() << ".";
+    return std::nullopt;
+  }
 
   VLOG(3) << "Found staggered induction variable: " << operand->name()
           << " (index=" << staggered_index << ", init=" << *init_value
@@ -379,7 +413,7 @@ static std::optional<StaggeredVariable> TryResolveStaggeredVariable(
 }
 
 absl::StatusOr<std::optional<DynamicSliceDescriptor>> AnalyzeDynamicSlice(
-    const HloInstruction* instr) {
+    const HloInstruction* instr, bool enable_table_offsets) {
   // Step 1: Only analyze dynamic-slice and dynamic-update-slice instructions.
   if (instr->opcode() != HloOpcode::kDynamicSlice &&
       instr->opcode() != HloOpcode::kDynamicUpdateSlice) {
@@ -482,7 +516,10 @@ absl::StatusOr<std::optional<DynamicSliceDescriptor>> AnalyzeDynamicSlice(
       }
       byte_offset += ClampDimensionOffset(instr, i, *value) * (*strides)[i];
     }
-    return DynamicSliceDescriptor{std::nullopt, std::nullopt, byte_offset, 0};
+
+    return DynamicSliceDescriptor{
+        std::nullopt, std::nullopt,
+        DynamicSliceDescriptor::Linear{byte_offset, 0}};
   }
 
   // Step 5: All resolved offsets must be consistent — same while loop, same
@@ -514,25 +551,34 @@ absl::StatusOr<std::optional<DynamicSliceDescriptor>> AnalyzeDynamicSlice(
     return std::nullopt;
   }
 
-  InitStep init_step =
-      GetInitStepForVariable(front.init_step_variable, loop_config);
+  // Step 7: Determine the init/step of the variable the offsets depend on.
+  // A staggered variable receives the induction variable every iteration
+  // (verified by TryResolveStaggeredVariable), so it advances by the induction
+  // variable's step from its own initial value. E.g. if the primary ivar
+  // starts at 1 with step 1, a staggered copy starts at 0.
+  std::optional<InitStep> maybe_init_step;
+  if (all_staggered) {
+    maybe_init_step = InitStep{resolved_offsets.front().staggered_init,
+                               loop_config.known_init_step().step()};
+  } else {
+    maybe_init_step =
+        GetInitStepForVariable(front.init_step_variable, loop_config);
+  }
+  if (!maybe_init_step.has_value()) {
+    return std::nullopt;
+  }
+  InitStep init_step = *maybe_init_step;
   int64_t trip_count = loop_config.known_trip_count().n();
 
   if (trip_count < 1) {
     return std::nullopt;
   }
 
-  // Step 7: For staggered variables, the iteration sequence uses the staggered
-  // init value rather than the primary induction variable's init. E.g. if the
-  // primary ivar starts at 1 with step 1, a staggered copy starts at 0.
-  int64_t effective_init =
-      all_staggered ? resolved_offsets.front().staggered_init : init_step.init;
-
   // Step 8: Evaluate the byte offset for every iteration by substituting the
   // induction variable value into HloEvaluator.
   std::vector<EvaluatedByteOffsets> offsets(trip_count);
   for (int64_t iter = 0; iter < trip_count; ++iter) {
-    int64_t ivar = effective_init + iter * init_step.step;
+    int64_t ivar = init_step.init + iter * init_step.step;
     ABSL_ASSIGN_OR_RETURN(offsets[iter], EvaluateByteOffsetAtIteration(
                                         instr, *strides, induction_var,
                                         functional_dependencies, ivar));
@@ -541,14 +587,7 @@ absl::StatusOr<std::optional<DynamicSliceDescriptor>> AnalyzeDynamicSlice(
             << ", clamped_byte_offset=" << offsets[iter].clamped;
   }
 
-  // Step 9: Verify linearity of the affine progression and ensure that the
-  // runtime 1D buffer clamping performed by DynamicSliceFusionV2Thunk matches
-  // the per-dimension clamped HLO byte offset on every iteration. First check
-  // whether the per-dimension clamped offsets already form a linear progression
-  // (which covers all in-bounds slices as well as slices whose inner-dimension
-  // offsets clamp to a constant across all iterations). Otherwise, check
-  // whether the unclamped offsets form a linear progression whose 1D buffer
-  // clamping matches the per-dimension clamped offset on every iteration.
+  // Step 9: Use a compact linear representation whenever possible.
   const Shape& slice_shape = (instr->opcode() == HloOpcode::kDynamicSlice)
                                  ? instr->shape()
                                  : instr->operand(1)->shape();
@@ -569,35 +608,62 @@ absl::StatusOr<std::optional<DynamicSliceDescriptor>> AnalyzeDynamicSlice(
     return stride;
   };
 
-  int64_t byte_offset = 0;
-  int64_t byte_stride = 0;
+  // A zero stride means that the offset is loop-invariant, and the descriptor
+  // must not reference the while loop (see `loop_index` in DynamicSliceConfig).
+  auto make_linear = [&](int64_t byte_offset, int64_t byte_stride) {
+    if (byte_stride == 0) {
+      return DynamicSliceDescriptor{
+          std::nullopt, std::nullopt,
+          DynamicSliceDescriptor::Linear{byte_offset, byte_stride}};
+    }
+    return DynamicSliceDescriptor{
+        while_loop, front.loop_index,
+        DynamicSliceDescriptor::Linear{byte_offset, byte_stride}};
+  };
+
+  // Prefer a linear progression of the per-dimension clamped offsets.
   if (auto stride = get_linear_stride(
           [](const EvaluatedByteOffsets& o) { return o.clamped; })) {
-    byte_offset = offsets[0].clamped;
-    byte_stride = *stride;
-  } else if (auto stride = get_linear_stride(
-                 [](const EvaluatedByteOffsets& o) { return o.unclamped; });
-             stride.has_value() &&
-             absl::c_all_of(offsets, [&](const EvaluatedByteOffsets& o) {
-               return std::clamp<int64_t>(o.unclamped, 0, max_buffer_offset) ==
-                      o.clamped;
-             })) {
-    byte_offset = offsets[0].unclamped;
-    byte_stride = *stride;
-  } else {
+    return make_linear(offsets[0].clamped, *stride);
+  }
+
+  // Otherwise, use the unclamped progression if runtime buffer clamping
+  // reproduces the per-dimension clamped offsets on every iteration.
+  if (auto stride = get_linear_stride(
+          [](const EvaluatedByteOffsets& o) { return o.unclamped; });
+      stride.has_value() &&
+      absl::c_all_of(offsets, [&](const EvaluatedByteOffsets& o) {
+        return std::clamp<int64_t>(o.unclamped, 0, max_buffer_offset) ==
+               o.clamped;
+      })) {
+    return make_linear(offsets[0].unclamped, *stride);
+  }
+
+  // Otherwise, store one clamped offset per iteration.
+  if (!enable_table_offsets) {
     VLOG(3) << instr->name()
             << ": neither unclamped nor clamped offsets form a valid linear "
                "progression over "
-            << trip_count << " iterations";
+            << trip_count << " iterations, and table offsets are disabled";
     return std::nullopt;
   }
 
-  VLOG(2) << instr->name() << ": linear pattern confirmed over " << trip_count
-          << " iterations: offset=" << byte_offset
-          << ", stride=" << byte_stride;
+  if (trip_count > DynamicSliceDescriptor::kMaxTableOffsets) {
+    VLOG(3) << instr->name() << ": offset table with " << trip_count
+            << " entries exceeds the limit of "
+            << DynamicSliceDescriptor::kMaxTableOffsets;
+    return std::nullopt;
+  }
 
-  return DynamicSliceDescriptor{while_loop, front.loop_index, byte_offset,
-                                byte_stride};
+  std::vector<int64_t> byte_offsets;
+  byte_offsets.reserve(trip_count);
+  for (const auto& offset : offsets) {
+    byte_offsets.push_back(offset.clamped);
+  }
+
+  return DynamicSliceDescriptor{
+      while_loop, front.loop_index,
+      DynamicSliceDescriptor::Table{std::move(byte_offsets)}};
 }
 
 //===-----------------------------------------------------------------------===/
@@ -703,12 +769,14 @@ std::optional<bool> IsNonOverlapping(const DynamicSliceChain& chain) {
 
   auto analyze_instr = [](const HloInstruction* instr)
       -> std::optional<std::pair<DynamicSliceDescriptor, int64_t>> {
-    auto result = AnalyzeDynamicSlice(instr);
+    // Descriptors are only used to check for overlaps and never serialized, so
+    // it is safe to analyze offsets that require a table.
+    auto result = AnalyzeDynamicSlice(instr, /*enable_table_offsets=*/true);
     if (!result.ok() || !result->has_value()) {
       return std::nullopt;
     }
     int64_t slice_byte_size = ShapeUtil::ByteSizeOf(instr->operand(1)->shape());
-    return std::make_pair(**result, slice_byte_size);
+    return std::make_pair(std::move(**result), slice_byte_size);
   };
 
   // Only check DUS-vs-DUS overlap. DS reads and DUS writes to the same slice
@@ -727,22 +795,28 @@ std::optional<bool> IsNonOverlapping(const DynamicSliceChain& chain) {
     return true;
   }
 
-  auto front_loop = dus_descriptors.front().first.while_loop;
-  if (!front_loop.has_value()) {
-    return std::nullopt;
-  }
-  const HloInstruction* while_loop = *front_loop;
+  // Loop-invariant updates have no while loop and write to the same byte range
+  // on every iteration. All loop-dependent updates must share the same loop.
+  std::optional<const HloInstruction*> while_loop;
   for (const auto& [desc, _] : dus_descriptors) {
-    if (desc.while_loop != front_loop) {
+    if (!desc.while_loop.has_value()) {
+      continue;
+    }
+    if (!while_loop.has_value()) {
+      while_loop = desc.while_loop;
+    } else if (desc.while_loop != while_loop) {
       return std::nullopt;
     }
   }
 
-  auto loop_config = while_loop->backend_config<WhileLoopBackendConfig>();
-  if (!loop_config.ok() || !loop_config->has_known_trip_count()) {
-    return std::nullopt;
+  int64_t trip_count = 1;
+  if (while_loop.has_value()) {
+    auto loop_config = (*while_loop)->backend_config<WhileLoopBackendConfig>();
+    if (!loop_config.ok() || !loop_config->has_known_trip_count()) {
+      return std::nullopt;
+    }
+    trip_count = loop_config->known_trip_count().n();
   }
-  int64_t trip_count = loop_config->known_trip_count().n();
   int64_t buffer_byte_size =
       ShapeUtil::ByteSizeOf(chain.updates.front()->operand(0)->shape());
 
@@ -751,8 +825,8 @@ std::optional<bool> IsNonOverlapping(const DynamicSliceChain& chain) {
     ranges.reserve(dus_descriptors.size());
     for (const auto& [desc, byte_size] : dus_descriptors) {
       int64_t max_offset = std::max<int64_t>(0, buffer_byte_size - byte_size);
-      int64_t offset = std::clamp<int64_t>(
-          desc.byte_offset + desc.byte_stride * iter, 0, max_offset);
+      int64_t offset =
+          std::clamp<int64_t>(desc.ByteOffset(iter), 0, max_offset);
       ranges.push_back({offset, byte_size});
     }
 

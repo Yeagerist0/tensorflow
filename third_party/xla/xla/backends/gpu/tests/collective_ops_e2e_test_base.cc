@@ -18,15 +18,23 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
+#include "absl/algorithm/container.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "xla/backends/gpu/tests/hlo_pjrt_gpu_test_base.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -41,9 +49,11 @@ limitations under the License.
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/service/hlo_runner_interface.h"
+#include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/xla.pb.h"
 #include "xla/xla_data.pb.h"
+#include "tsl/platform/path.h"
 
 namespace xla {
 namespace {
@@ -188,6 +198,71 @@ CollectiveOpsWithFlagsBase::CreateExecutable(absl::string_view hlo_string,
                    ParseAndReturnVerifiedModule(hlo_string, config));
   return test_runner().CreateExecutable(std::move(module),
                                         /*run_hlo_passes=*/true);
+}
+
+absl::StatusOr<CommandBufferThunkCounts> CountThunksInDump(
+    absl::string_view dump_dir, absl::string_view thunk_kind_prefix) {
+  std::vector<std::string> dump_files;
+  ABSL_RETURN_IF_ERROR(tsl::Env::Default()->GetMatchingPaths(
+      tsl::io::JoinPath(dump_dir, "*thunk_sequence_after_thunk_passes*.txt"),
+      &dump_files));
+  if (dump_files.empty()) {
+    // When thunk passes make no changes (e.g. no command buffers are formed),
+    // only the initial thunk_sequence.txt dump is written.
+    ABSL_RETURN_IF_ERROR(tsl::Env::Default()->GetMatchingPaths(
+        tsl::io::JoinPath(dump_dir, "*thunk_sequence.txt"), &dump_files));
+  }
+  if (dump_files.size() != 1) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("Expected exactly one thunk sequence dump in ", dump_dir,
+                     ", found ", dump_files.size()));
+  }
+  std::string dump;
+  ABSL_RETURN_IF_ERROR(
+      tsl::ReadFileToString(tsl::Env::Default(), dump_files[0], &dump));
+
+  // Each thunk line in the dump has the form "<indent><index>: <kind> ...",
+  // where the indentation grows with the nesting depth. Thunks nested inside a
+  // kCommandBuffer thunk are indented under it; non-thunk lines (such as
+  // WhileThunk's "condition:" and "body:" headers) do not start with
+  // "<digits>: " and are ignored.
+  //
+  // A kCommandBuffer thunk is not necessarily top-level: when control flow
+  // cannot be captured (e.g. on ROCm, where HIP graphs have no conditional
+  // nodes and the WHILE command is disabled), the loop body is still converted
+  // into a command buffer nested inside the WhileThunk. Track the indentation
+  // of the innermost enclosing kCommandBuffer so those thunks are counted as
+  // being inside a command buffer too.
+  CommandBufferThunkCounts counts;
+  constexpr size_t kNoCommandBuffer = std::numeric_limits<size_t>::max();
+  size_t command_buffer_indent = kNoCommandBuffer;
+  for (absl::string_view line : absl::StrSplit(dump, '\n')) {
+    absl::string_view thunk = absl::StripLeadingAsciiWhitespace(line);
+    size_t pos = thunk.find(": ");
+    if (pos == absl::string_view::npos || pos == 0 ||
+        !absl::c_all_of(thunk.substr(0, pos),
+                        [](char c) { return absl::ascii_isdigit(c); })) {
+      continue;
+    }
+    const size_t indent = line.size() - thunk.size();
+    thunk.remove_prefix(pos + 2);
+    // A thunk at or above the indentation of the open command buffer is a
+    // sibling (or an ancestor's sibling), so the command buffer has ended.
+    if (command_buffer_indent != kNoCommandBuffer &&
+        indent <= command_buffer_indent) {
+      command_buffer_indent = kNoCommandBuffer;
+    }
+    if (command_buffer_indent == kNoCommandBuffer &&
+        absl::StartsWith(thunk, "kCommandBuffer")) {
+      command_buffer_indent = indent;
+    }
+    if (absl::StartsWith(thunk, thunk_kind_prefix)) {
+      ++(command_buffer_indent != kNoCommandBuffer
+             ? counts.in_command_buffer
+             : counts.outside_command_buffer);
+    }
+  }
+  return counts;
 }
 
 }  // namespace xla

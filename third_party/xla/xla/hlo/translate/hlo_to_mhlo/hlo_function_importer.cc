@@ -69,8 +69,8 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/ir/hlo_original_value.h"
 #include "xla/hlo/ir/hlo_sharding.h"
-#include "xla/hlo/ir/hlo_sharding_metadata.h"
 #include "xla/hlo/translate/hlo_to_mhlo/async_importer.h"
 #include "xla/hlo/translate/hlo_to_mhlo/attribute_importer.h"
 #include "xla/hlo/translate/hlo_to_mhlo/custom_call_importer.h"
@@ -447,37 +447,60 @@ absl::StatusOr<FuncOp> HloFunctionImporter::ImportAsFunc(
         return Internal("Expected %d leaf parameters but got %d",
                         flattened_shardings.size(), leaf_count);
       }
-
-      for (int i = 0; i < leaf_count; ++i) {
-        mlir::NamedAttrList argAttrs(function.getArgAttrDict(arg_index));
-        if (!flattened_shardings.empty()) {
-          argAttrs.set(xla::kMhloSharding,
-                       ConvertSharding(flattened_shardings[i], builder_));
-        }
-        if (frontend_attributes) {
-          if (leaf_count > 1) {
-            return InvalidArgument(
-                "A tuple parameter that is being flattened shouldn't have "
-                "frontend attributes");
-          }
-          argAttrs.set(xla::kMhloFrontendAttributes, frontend_attributes);
-        }
-        if (parameter->parameter_replicated_at_leaf_buffers() &&
-            parameter->parameter_replicated_at_leaf_buffers()->at(i)) {
-          argAttrs.set(xla::kMhloParameterReplication,
-                       builder_->getBoolArrayAttr({true}));
-        }
-        // NOTE: since we are flattening args, all arguments will share the same
-        // location as the tuple parameter instruction.
-        function.getArgument(arg_index).setLoc(
-            mlir::hlo::GenerateInstructionLocation(instruction, context_));
-        funcArgAttrs[arg_index++] = argAttrs.getDictionary(context_);
+      if (frontend_attributes && leaf_count > 1) {
+        return InvalidArgument(
+            "A tuple parameter that is being flattened shouldn't have "
+            "frontend attributes");
       }
+
+      int i = 0;
+      ShapeUtil::ForEachLeafShape(
+          parameter->shape(),
+          [&](const Shape& subshape, const ShapeIndex& index) {
+            mlir::NamedAttrList argAttrs(function.getArgAttrDict(arg_index));
+            if (!flattened_shardings.empty()) {
+              argAttrs.set(xla::kMhloSharding,
+                           ConvertSharding(flattened_shardings[i], builder_));
+            }
+            if (frontend_attributes) {
+              argAttrs.set(xla::kMhloFrontendAttributes, frontend_attributes);
+            }
+            if (parameter->parameter_replicated_at_leaf_buffers() &&
+                parameter->parameter_replicated_at_leaf_buffers()->at(i)) {
+              argAttrs.set(xla::kMhloParameterReplication,
+                           builder_->getBoolArrayAttr({true}));
+            }
+            if (parameter->original_value()) {
+              // Parameter instructions are not call instructions, so they never
+              // carry a call_hierarchy (or is_synthetic_call). Each flattened
+              // argument only needs the leaf OriginalArray at `index`.
+              const auto& orig_array =
+                  parameter->original_value()->original_array(index);
+              if (orig_array.has_value()) {
+                OriginalValue leaf_ov(subshape);
+                *leaf_ov.mutable_original_array({}) = *orig_array;
+                argAttrs.set(xla::kMhloOriginalValueAttr,
+                             ConvertOriginalValue(leaf_ov, builder_));
+              }
+            }
+            // NOTE: since we are flattening args, all arguments will share the
+            // same location as the tuple parameter instruction.
+            function.getArgument(arg_index).setLoc(
+                mlir::hlo::GenerateInstructionLocation(instruction, context_,
+                                                       &frame_locations_));
+            funcArgAttrs[arg_index++] = argAttrs.getDictionary(context_);
+            ++i;
+          });
     } else {
       mlir::NamedAttrList argAttrs(function.getArgAttrDict(arg_index));
       if (parameter->has_sharding()) {
         argAttrs.set(xla::kMhloSharding,
                      ConvertSharding(parameter->sharding(), builder_));
+      }
+      if (parameter->original_value()) {
+        argAttrs.set(
+            xla::kMhloOriginalValueAttr,
+            ConvertOriginalValue(*parameter->original_value(), builder_));
       }
       if (frontend_attributes) {
         argAttrs.set(
@@ -498,7 +521,8 @@ absl::StatusOr<FuncOp> HloFunctionImporter::ImportAsFunc(
         }
       }
       function.getArgument(arg_index).setLoc(
-          mlir::hlo::GenerateInstructionLocation(instruction, context_));
+          mlir::hlo::GenerateInstructionLocation(instruction, context_,
+                                                 &frame_locations_));
       funcArgAttrs[arg_index++] = argAttrs.getDictionary(context_);
     }
   }
@@ -590,17 +614,9 @@ absl::StatusOr<Value> HloFunctionImporter::ImportInstructionsImpl(
   // Setup the input parameters.
   const int num_parameters = computation.num_parameters();
 
-  FuncOp func = llvm::dyn_cast<FuncOp>(builder->getBlock()->getParentOp());
   for (int i = 0; i < num_parameters; i++) {
     auto* hlo_parameter = computation.parameter_instruction(i);
     instruction_value_map_[hlo_parameter] = arguments[i];
-    // Only add original value attributes to parameters in functions. Skip
-    // regions.
-    if (hlo_parameter->original_value() && func) {
-      func.setArgAttr(
-          i, kMhloOriginalValueAttr,
-          ConvertOriginalValue(*hlo_parameter->original_value(), builder_));
-    }
   }
 
   for (auto instruction : computation.MakeInstructionPostOrder()) {
@@ -739,7 +755,7 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
   ABSL_ASSIGN_OR_RETURN(auto result_type,
                    ConvertShapeToType<RankedTensorType>(shape, *builder_));
   mlir::Location loc = mlir::hlo::GenerateInstructionLocation(
-      instruction, func_builder->getContext());
+      instruction, func_builder->getContext(), &frame_locations_);
 
   llvm::SmallVector<NamedAttribute, 10> attributes;
   if (instruction->has_sharding()) {
@@ -1259,7 +1275,9 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
         // we don't want to expose this implementation detail to MHLO/StableHLO
         // users.
         if (!custom_call->IsCustomCall(kPinCustomCallTarget) &&
-            !custom_call->IsCustomCall(kUnpinCustomCallTarget)) {
+            !custom_call->IsCustomCall(kUnpinCustomCallTarget) &&
+            !custom_call->IsCustomCall(kFanOutCustomCallTarget) &&
+            !custom_call->IsCustomCall(kFanInCustomCallTarget)) {
           attributes.push_back(builder_->getNamedAttr(
               "output_operand_aliases",
               ConvertOutputOperandAliasing(
@@ -1279,7 +1297,9 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
           "api_version", mlir::stablehlo::CustomCallApiVersionAttr::get(
                              builder_->getContext(), mlir_api_version)));
       if (!custom_call->IsCustomCall(kPinCustomCallTarget) &&
-          !custom_call->IsCustomCall(kUnpinCustomCallTarget)) {
+          !custom_call->IsCustomCall(kUnpinCustomCallTarget) &&
+          !custom_call->IsCustomCall(kFanOutCustomCallTarget) &&
+          !custom_call->IsCustomCall(kFanInCustomCallTarget)) {
         attributes.push_back(builder_->getNamedAttr(
             "output_operand_aliases",
             stablehlo::ConvertOutputOperandAliasing(
@@ -1307,6 +1327,11 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
           builder_->getBoolAttr(instruction->cholesky_options().lower())));
       return mlir::stablehlo::CholeskyOp::create(
                  *func_builder, loc, result_type, operands, attributes)
+          .getOperation();
+    }
+    case HloOpcode::kFma: {
+      return mlir::stablehlo::FmaOp::create(*func_builder, loc, result_type,
+                                            operands, attributes)
           .getOperation();
     }
     case HloOpcode::kGather: {
@@ -2268,40 +2293,6 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
       return CreateTupleFromOpResults(func_builder, loc, op.getOperation(),
                                       operands[0].getType());
     }
-    case HloOpcode::kDomain: {
-      auto domain_kind = mlir::mhlo::symbolizeDomainKind(
-          ToStringRef(instruction->user_side_metadata().Kind()));
-      if (!domain_kind || *domain_kind != mlir::mhlo::DomainKind::sharding) {
-        return InvalidArgument(
-            "Invalid domain kind in hlo -> mhlo import. Only 'sharding' is "
-            "supported");
-      }
-      attributes.push_back(builder_->getNamedAttr(
-          "kind", mlir::mhlo::DomainKindAttr::get(func_builder->getContext(),
-                                                  *domain_kind)));
-
-      // In XLA, DomainMetadata is open-world, but in the proto, it is
-      // hardcoded to be ShardingMetadata. Thankfully, the only other
-      // implementation of DomainMetadata is OpName, which is generally used
-      // for debugging and never for compiling production models.
-      //
-      // Since this is hardcoded as such in the proto, we must follow suit.
-      auto exit_metadata = ShardingMetadata::ToShardingMetadata(
-          &instruction->operand_side_metadata());
-      auto entry_metadata = ShardingMetadata::ToShardingMetadata(
-          &instruction->user_side_metadata());
-      attributes.push_back(builder_->getNamedAttr(
-          "exit_metadata",
-          ConvertSharding(*(*exit_metadata)->sharding(), builder_)));
-      attributes.push_back(builder_->getNamedAttr(
-          "entry_metadata",
-          ConvertSharding(*(*entry_metadata)->sharding(), builder_)));
-
-      // XLA Feature -- MHLO Only
-      return mlir::mhlo::DomainOp::create(*func_builder, loc, result_type,
-                                          operands, attributes)
-          .getOperation();
-    }
 
 #define NO_ATTRIBUTE_CASE(hlo_op_code, mlir_op)                              \
   case HloOpcode::hlo_op_code: {                                             \
@@ -2404,6 +2395,7 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
       NO_ATTRIBUTE_CASE_MHLO(kCosh, CoshOp);
       NO_ATTRIBUTE_CASE_MHLO(kCopy, CopyOp);
       NO_ATTRIBUTE_CASE_MHLO(kErf, ErfOp);
+      NO_ATTRIBUTE_CASE_MHLO(kMulhi, MulhiOp);
       NO_ATTRIBUTE_CASE_MHLO(kSinh, SinhOp);
       NO_ATTRIBUTE_CASE_MHLO(kStochasticConvert, StochasticConvertOp);
 
@@ -2424,9 +2416,11 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
       RESULT_ACCURACY_CASE(kCbrt, CbrtOp);
       RESULT_ACCURACY_CASE(kCos, CosineOp);
       RESULT_ACCURACY_CASE(kExp, ExpOp);
+      RESULT_ACCURACY_CASE(kExp2, Exp2Op);
       RESULT_ACCURACY_CASE(kExpm1, Expm1Op);
       RESULT_ACCURACY_CASE(kLog, LogOp);
       RESULT_ACCURACY_CASE(kLog1p, Log1pOp);
+      RESULT_ACCURACY_CASE(kLog2, Log2Op);
       RESULT_ACCURACY_CASE(kLogistic, LogisticOp);
       RESULT_ACCURACY_CASE(kRsqrt, RsqrtOp);
       RESULT_ACCURACY_CASE(kSin, SineOp);
@@ -2595,18 +2589,24 @@ mlir::NamedAttribute HloFunctionImporter::ConvertComparisonDirection(
 
 mlir::NamedAttribute HloFunctionImporter::ConvertComparisonOrder(
     ComparisonOrder order) {
-  mlir::stablehlo::ComparisonType type;
   switch (order) {
     case ComparisonOrder::kPartial:
-      type = mlir::stablehlo::ComparisonType::FLOAT;
-      break;
+      return builder_->getNamedAttr(
+          "compare_type",
+          mlir::stablehlo::ComparisonTypeAttr::get(
+              builder_->getContext(), mlir::stablehlo::ComparisonType::FLOAT));
     case ComparisonOrder::kTotal:
-      type = mlir::stablehlo::ComparisonType::TOTALORDER;
-      break;
+      return builder_->getNamedAttr(
+          "compare_type", mlir::stablehlo::ComparisonTypeAttr::get(
+                              builder_->getContext(),
+                              mlir::stablehlo::ComparisonType::TOTALORDER));
+    case ComparisonOrder::kWeak:
+      return builder_->getNamedAttr(
+          "compare_type", mlir::stablehlo::ComparisonTypeAttr::get(
+                              builder_->getContext(),
+                              mlir::stablehlo::ComparisonType::WEAKORDER));
   }
-  return builder_->getNamedAttr(
-      "compare_type",
-      mlir::stablehlo::ComparisonTypeAttr::get(builder_->getContext(), type));
+  LOG(FATAL) << "Unhandled comparison order: " << static_cast<int>(order);
 }
 
 mlir::DenseIntElementsAttr HloFunctionImporter::ConvertDimensions(

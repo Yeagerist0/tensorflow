@@ -374,7 +374,8 @@ class ShapeInference {
   static absl::StatusOr<Shape> InferDotOpShape(
       const Shape& lhs, const Shape& rhs,
       const DotDimensionNumbers& dimension_numbers,
-      std::optional<PrimitiveType> preferred_element_type);
+      std::optional<PrimitiveType> preferred_element_type,
+      const SparsityConfig& sparsity_config = {});
 
   // Helper that infers the shape produced by performing a ragged dot operation
   // with the given LHS and RHS shapes. An optional preferred_element_type can
@@ -435,6 +436,10 @@ class ShapeInference {
   static absl::StatusOr<Shape> InferClampShape(const Shape& min,
                                                const Shape& operand,
                                                const Shape& max);
+
+  // Helper for inferring the shape of Fma ops.
+  static absl::StatusOr<Shape> InferFmaShape(const Shape& a, const Shape& b,
+                                             const Shape& c);
 
   // Helper for inferring the shape of Select ops.
   static absl::StatusOr<Shape> InferSelectShape(const Shape& pred,

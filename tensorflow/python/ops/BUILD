@@ -210,6 +210,7 @@ tf_gen_op_strict_wrapper_private_py(
     visibility = [
         "//learning/brain/python/ops:__pkg__",
         "//tensorflow/python:__pkg__",
+        "//tensorflow/python/kernel_tests/random:__pkg__",
     ],
 )
 
@@ -535,6 +536,7 @@ tf_gen_op_strict_wrapper_private_py(
 tf_gen_op_strict_wrapper_private_py(
     name = "stateless_random_ops_gen",
     visibility = [
+        "//tensorflow/compiler/tests:__pkg__",
         "//tensorflow/dtensor:dtensor-internal",
         "//tensorflow/python:__pkg__",
         "//tensorflow/python/data/experimental/ops:__pkg__",
@@ -794,6 +796,7 @@ py_library(
     deps = [
         ":array_ops_gen",
         ":array_ops_stack",
+        ":logging_ops_gen",
         ":math_ops_gen",
         ":shape_util",
         "//tensorflow/core/config:flags_py",
@@ -830,9 +833,11 @@ py_library(
     visibility = ["//visibility:public"],
     deps = [
         ":array_ops_gen",
+        "//tensorflow/python/framework:composite_tensor",
         "//tensorflow/python/framework:ops",
         "//tensorflow/python/util:dispatch",
         "//tensorflow/python/util:tf_export",
+        "//third_party/py/numpy",
     ],
 )
 
@@ -1123,12 +1128,15 @@ py_library(
         ":array_ops",
         ":cond",
         ":control_flow_ops_gen",
+        ":control_flow_util",
         ":logging_ops_gen",
         ":math_ops_gen",
+        ":string_ops",
         "//tensorflow/python/eager:context",
         "//tensorflow/python/framework:dtypes",
         "//tensorflow/python/framework:errors",
         "//tensorflow/python/framework:ops",
+        "//tensorflow/python/types:internal",
         "//tensorflow/python/util:dispatch",
         "//tensorflow/python/util:tf_export",
         "//tensorflow/python/util:tf_should_use",
@@ -1262,6 +1270,7 @@ py_library(
         "//tensorflow/python/framework:ops",
         "//tensorflow/python/framework:tensor_shape",
         "//tensorflow/python/framework:type_spec",
+        "//tensorflow/python/types:core",
         "//tensorflow/python/util:deprecation",
         "//tensorflow/python/util:nest",
         "//tensorflow/python/util:tf_export",
@@ -1494,6 +1503,7 @@ py_library(
         ":array_ops",
         ":array_ops_gen",
         ":array_ops_stack",
+        ":control_flow_assert",
         ":ctc_ops_gen",
         ":custom_gradient",
         ":functional_ops",
@@ -2819,9 +2829,11 @@ cuda_py_strict_test(
         ":math_ops",
         ":rnn_grad",
         ":rnn_ops_gen",
+        "//tensorflow/python/eager:def_function",
         "//tensorflow/python/framework:dtypes",
         "//tensorflow/python/framework:errors",
         "//tensorflow/python/framework:ops",
+        "//tensorflow/python/framework:tensor_spec",
         "//tensorflow/python/framework:test_lib",
         "//tensorflow/python/platform:client_testlib",
         "//third_party/py/numpy",
@@ -3437,6 +3449,7 @@ cuda_py_strict_test(
         "//tensorflow/python/eager:backprop",
         "//tensorflow/python/eager:context",
         "//tensorflow/python/eager:def_function",
+        "//tensorflow/python/eager:forwardprop",
         "//tensorflow/python/framework:constant_op",
         "//tensorflow/python/framework:dtypes",
         "//tensorflow/python/framework:function",
@@ -3504,6 +3517,7 @@ py_library(
         ":math_ops",
         "//tensorflow/python/eager:backprop",
         "//tensorflow/python/eager:context",
+        "//tensorflow/python/eager:def_function",
         "//tensorflow/python/framework:config",
         "//tensorflow/python/framework:constant_op",
         "//tensorflow/python/framework:dtypes",
@@ -3637,6 +3651,7 @@ cuda_py_strict_test(
     tags = [
         "no_windows_gpu",
     ],
+    xla_enabled = True,
     deps = [
         ":array_ops",
         ":gradients",
@@ -3673,6 +3688,7 @@ cuda_py_strict_test(
     ],
     deps = [
         ":math_ops",
+        ":math_ops_gen",
         "//tensorflow/python/eager:def_function",
         "//tensorflow/python/framework:dtypes",
         "//tensorflow/python/framework:tensor",
@@ -3704,6 +3720,7 @@ cuda_py_strict_test(
         ":nn_ops_gen",
         ":variables",
         "//tensorflow/python/eager:context",
+        "//tensorflow/python/eager:def_function",
         "//tensorflow/python/framework:constant_op",
         "//tensorflow/python/framework:dtypes",
         "//tensorflow/python/framework:ops",
@@ -3998,6 +4015,7 @@ tf_py_strict_test(
         "//tensorflow/python/framework:constant_op",
         "//tensorflow/python/framework:dtypes",
         "//tensorflow/python/framework:errors",
+        "//tensorflow/python/framework:test_lib",
         "//tensorflow/python/platform:client_testlib",
         "//third_party/py/numpy",
     ],
@@ -4376,6 +4394,7 @@ py_library(
         ":array_ops",
         ":array_ops_stack",
         ":candidate_sampling_ops",
+        ":check_ops",
         ":cond",
         ":ctc_ops",
         ":custom_gradient",

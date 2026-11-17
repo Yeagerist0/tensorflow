@@ -347,7 +347,6 @@ cc_library(
         "//tensorflow/core/tfrt/fallback:op_kernel_runner",
         "//tensorflow/core/tfrt/fallback:op_kernel_runner_cache",
         "//tensorflow/core/tfrt/utils",
-        "//tensorflow/core/tfrt/utils:error_util",
         "//tensorflow/core/tfrt/utils:fallback_tensor",
         "//tensorflow/core/tfrt/utils:tensor_util",
         "@com_google_absl//absl/base",

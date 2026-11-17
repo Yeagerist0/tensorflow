@@ -75,7 +75,7 @@ def CompileAndExecuteOp : TensorflowMlrtTpu_Op<"compile_and_execute"> {
   );
 
   let assemblyFormat = [{
-    `(` $operands_and_static_shapes `)` attr-dict `:` functional-type($operands_and_static_shapes, results)
+    `(` $operands_and_static_shapes `)` prop-dict attr-dict `:` functional-type($operands_and_static_shapes, results)
   }];
 }
 

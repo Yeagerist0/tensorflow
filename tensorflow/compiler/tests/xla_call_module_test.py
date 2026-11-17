@@ -1590,7 +1590,7 @@ module @jit_f.0 {
         errors.InvalidArgumentError,
         'Cannot deserialize computation: .+',
     ):
-      with self.test_scope():
+      with self.device_scope():
         f(x)
 
 

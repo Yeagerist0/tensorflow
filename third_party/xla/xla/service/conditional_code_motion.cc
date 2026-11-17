@@ -47,6 +47,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_original_value.h"
 #include "xla/hlo/ir/hlo_original_value_util.h"
 #include "xla/hlo/ir/hlo_print_options.h"
+#include "xla/hlo/ir/hlo_sharding.h"
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/hlo/transforms/simplifiers/hlo_dce.h"
 #include "xla/hlo/transforms/simplifiers/tuple_simplifier.h"
@@ -85,6 +86,124 @@ void UpdateOriginalValueForWidenedBranchArgument(
     CopyOriginalValue(argument_tuple, instruction, /*clone=*/true,
                       /*issue_warning=*/true);
   }
+}
+
+// Updates the sharding of an instruction inside a conditional branch (or a
+// user tuple outside) after MoveOperandIntoBranch widened the argument tuple.
+void UpdateShardingForWidenedBranchArgument(
+    HloInstruction* instruction, const HloInstruction* argument_tuple) {
+  if (!instruction->has_sharding()) {
+    return;
+  }
+  const Shape& shape = instruction->shape();
+  int64_t leaf_count = ShapeUtil::GetLeafCount(shape);
+  if (!shape.IsTuple()) {
+    if (instruction->sharding().IsTuple()) {
+      if (auto single = instruction->sharding().ExtractSingleSharding();
+          single.has_value() && single->Validate(shape).ok()) {
+        instruction->set_sharding(*single);
+      } else {
+        instruction->clear_sharding();
+      }
+    } else if (!instruction->sharding().Validate(shape).ok()) {
+      instruction->clear_sharding();
+    }
+    return;
+  }
+  if (leaf_count == 0) {
+    HloSharding empty_sharding = HloSharding::Tuple(shape, {});
+    if (empty_sharding.Validate(shape).ok()) {
+      instruction->set_sharding(empty_sharding);
+    } else {
+      instruction->clear_sharding();
+    }
+    return;
+  }
+  if (instruction->sharding().IsTuple() &&
+      instruction->sharding().tuple_elements().size() == leaf_count &&
+      instruction->sharding().Validate(shape).ok()) {
+    return;
+  }
+  const HloInstruction* tuple_source =
+      argument_tuple != nullptr ? argument_tuple : instruction;
+  if (tuple_source != nullptr && tuple_source->opcode() == HloOpcode::kTuple &&
+      tuple_source->operand_count() == shape.tuple_shapes_size()) {
+    std::vector<HloSharding> element_shardings;
+    bool all_have_sharding = true;
+    int64_t leaf_idx = 0;
+    for (int64_t i = 0; i < tuple_source->operand_count(); ++i) {
+      const HloInstruction* op = tuple_source->operand(i);
+      const Shape& op_shape = shape.tuple_shapes(i);
+      int64_t op_leaves = ShapeUtil::GetLeafCount(op_shape);
+      if (op_leaves == 0) {
+        continue;
+      }
+      if (op->has_sharding()) {
+        if (op->sharding().IsTuple()) {
+          if (op->sharding().tuple_elements().size() == op_leaves) {
+            for (const auto& elem : op->sharding().tuple_elements()) {
+              element_shardings.push_back(elem);
+            }
+          } else {
+            all_have_sharding = false;
+            break;
+          }
+        } else {
+          for (int64_t l = 0; l < op_leaves; ++l) {
+            element_shardings.push_back(op->sharding());
+          }
+        }
+      } else if (instruction->sharding().IsTuple() &&
+                 leaf_idx + op_leaves <=
+                     instruction->sharding().tuple_elements().size()) {
+        for (int64_t l = 0; l < op_leaves; ++l) {
+          element_shardings.push_back(
+              instruction->sharding().tuple_elements()[leaf_idx + l]);
+        }
+      } else if (auto single = instruction->sharding().ExtractSingleSharding();
+                 single.has_value()) {
+        for (int64_t l = 0; l < op_leaves; ++l) {
+          element_shardings.push_back(*single);
+        }
+      } else {
+        all_have_sharding = false;
+        break;
+      }
+      leaf_idx += op_leaves;
+    }
+    if (all_have_sharding && element_shardings.size() == leaf_count) {
+      HloSharding candidate = HloSharding::Tuple(shape, element_shardings);
+      if (candidate.Validate(shape).ok()) {
+        instruction->set_sharding(candidate);
+        return;
+      }
+    }
+  }
+  if (argument_tuple != nullptr && argument_tuple->has_sharding()) {
+    if (argument_tuple->sharding().IsTuple()) {
+      if (argument_tuple->sharding().tuple_elements().size() == leaf_count &&
+          argument_tuple->sharding().Validate(shape).ok()) {
+        instruction->set_sharding(argument_tuple->sharding());
+        return;
+      }
+    } else {
+      HloSharding candidate =
+          HloSharding::Single(shape, argument_tuple->sharding());
+      if (candidate.Validate(shape).ok()) {
+        instruction->set_sharding(candidate);
+        return;
+      }
+    }
+  }
+  if (auto single = instruction->sharding().ExtractSingleSharding();
+      single.has_value()) {
+    HloSharding candidate = HloSharding::Single(shape, *single);
+    if (candidate.Validate(shape).ok()) {
+      instruction->set_sharding(candidate);
+      return;
+    }
+  }
+  instruction->clear_sharding();
 }
 
 HloInstruction* CloneNestedTuples(HloInstruction* tuple) {
@@ -154,7 +273,7 @@ class BoundaryVisitor {
     worklist_.push_back(b);
   }
   // Start with an empty work list.
-  BoundaryVisitor() {}
+  BoundaryVisitor() = default;
   // Get next boundary to visit.
   Boundary PopNextBoundary() {
     CHECK(!worklist_.empty());
@@ -190,17 +309,6 @@ class BoundaryVisitor {
   std::deque<Boundary> worklist_;
   absl::flat_hash_set<Boundary> visited_;
 };
-
-template <class OpCollection>
-int64_t CountNonLeafOps(const OpCollection& ops) {
-  absl::flat_hash_set<HloInstruction*> op_set;
-  for (auto op : ops) {
-    if (!op_set.contains(op) && op->opcode() != HloOpcode::kConstant) {
-      op_set.insert(op);
-    }
-  }
-  return op_set.size();
-}
 
 // Returns estimation of potential reuses carried by a given pair of
 // instructions.  Use different integers to classify different levels
@@ -1027,6 +1135,40 @@ absl::StatusOr<bool> ConditionalCodeMotion::MoveUserInstructionsIn(
 
     HloInstruction* new_root =
         computation->AddInstruction(HloInstruction::CreateTuple(operands));
+    if (old_root->has_sharding()) {
+      if (old_root->sharding().IsTuple()) {
+        std::vector<HloSharding> retained_leaves;
+        int64_t current_leaf = 0;
+        for (int j = 0; j < old_root->shape().tuple_shapes_size(); ++j) {
+          int64_t count =
+              ShapeUtil::GetLeafCount(old_root->shape().tuple_shapes(j));
+          if (j != use_index) {
+            for (int64_t l = 0; l < count; ++l) {
+              if (current_leaf + l <
+                  old_root->sharding().tuple_elements().size()) {
+                retained_leaves.push_back(
+                    old_root->sharding().tuple_elements()[current_leaf + l]);
+              }
+            }
+          }
+          current_leaf += count;
+        }
+        if (retained_leaves.size() ==
+            ShapeUtil::GetLeafCount(new_root->shape())) {
+          HloSharding candidate =
+              HloSharding::Tuple(new_root->shape(), retained_leaves);
+          if (candidate.Validate(new_root->shape()).ok()) {
+            new_root->set_sharding(candidate);
+          }
+        }
+      } else {
+        HloSharding candidate =
+            HloSharding::Single(new_root->shape(), old_root->sharding());
+        if (candidate.Validate(new_root->shape()).ok()) {
+          new_root->set_sharding(candidate);
+        }
+      }
+    }
     // The new root returns the values the branch still produces, so its
     // OriginalValue is assembled from its operands.
     new_root->set_original_value(
@@ -1081,6 +1223,7 @@ absl::StatusOr<bool> ConditionalCodeMotion::MoveUserInstructionsIn(
         *new_root->mutable_shape()->add_tuple_shapes() = new_op->shape();
         new_root->set_original_value(
             OriginalValue::CreateFromInstruction(new_root));
+        UpdateShardingForWidenedBranchArgument(new_root, new_root);
         VLOG(2) << "Extending conditional root " << i << " : "
                 << new_root->ToString() << "\n";
       }
@@ -1215,6 +1358,7 @@ class MoveOperandIntoBranch {
       used = false;
       *branch_param->mutable_shape() = *param_shape;
       UpdateOriginalValueForWidenedBranchArgument(branch_param, argument_tuple);
+      UpdateShardingForWidenedBranchArgument(branch_param, argument_tuple);
       const Shape* new_param_shape = nullptr;
       for (auto param_users : gte_users) {
         if (param_users.empty()) {
@@ -1244,6 +1388,7 @@ class MoveOperandIntoBranch {
             *param_user->mutable_shape() = *new_param_shape;
             param_user->set_original_value(
                 OriginalValue::CreateFromInstruction(param_user));
+            UpdateShardingForWidenedBranchArgument(param_user, nullptr);
             VLOG(1) << "branch parameter: " << param_user->ToString();
             used = true;
           } else {
@@ -1251,6 +1396,7 @@ class MoveOperandIntoBranch {
             *param_user->mutable_shape() = *new_param_shape;
             param_user->set_original_value(
                 OriginalValue::CreateFromInstruction(param_user));
+            UpdateShardingForWidenedBranchArgument(param_user, nullptr);
             CHECK_OK(param_user->ReplaceAllUsesWith(branch_param));
           }
         }
@@ -1316,6 +1462,7 @@ class MoveOperandIntoBranch {
       // The operands of the argument tuple changed, so its OriginalValue is
       // reassembled from them.
       user->set_original_value(OriginalValue::CreateFromInstruction(user));
+      UpdateShardingForWidenedBranchArgument(user, user);
       int64_t nesting_index = 1;
       for (auto user_now = user->users()[0];
            nesting_index < matching_tuple_indices.size() &&
@@ -1329,6 +1476,7 @@ class MoveOperandIntoBranch {
         }
         user_now->set_original_value(
             OriginalValue::CreateFromInstruction(user_now));
+        UpdateShardingForWidenedBranchArgument(user_now, user_now);
         VLOG(2) << "Done replacing tuple:" << user->ToString();
         CHECK_EQ(user_now->user_count(), 1);
       }
@@ -1375,6 +1523,7 @@ class MoveOperandIntoBranch {
         VLOG(5) << branch_comp->ToString() << "\n";
         *branch_param->mutable_shape() = *param_shape;
         UpdateOriginalValueForWidenedBranchArgument(branch_param, user);
+        UpdateShardingForWidenedBranchArgument(branch_param, user);
         if (branch_param == branch_comp->root_instruction()) {
           VLOG(2) << "Cloning root user";
           auto new_user =
@@ -1504,6 +1653,9 @@ class GroupConnectedBoundaries {
   bool has_outfeed_;
   // Instructions that have been visited but are not going to be moved.
   absl::flat_hash_map<HloInstruction*, int>& visited_count_;
+  // Distinct operands of an instruction that are not constants, counted once
+  // per conditional.
+  absl::flat_hash_map<const HloInstruction*, int>& non_leaf_operand_count_;
   // The following four lines are configurations of the cost model, which will
   // be used to determine whether to move an instruction (move_config_) and
   // how strongly preferred it is to keep a pair of ops together
@@ -1573,6 +1725,22 @@ class GroupConnectedBoundaries {
     return *loc;
   }
 
+  // Number of distinct operands of hlo other than constants. Every boundary
+  // that reaches hlo asks for it, so it is counted once per conditional.
+  int NonLeafOperandCount(const HloInstruction* hlo) {
+    auto [it, inserted] = non_leaf_operand_count_.try_emplace(hlo);
+    if (inserted) {
+      absl::flat_hash_set<const HloInstruction*> op_set;
+      for (const HloInstruction* op : hlo->operands()) {
+        if (op->opcode() != HloOpcode::kConstant) {
+          op_set.insert(op);
+        }
+      }
+      it->second = op_set.size();
+    }
+    return it->second;
+  }
+
   static std::vector<int64_t>& EnsureSearchConfig(
       std::vector<int64_t>& search_config) {
     if (search_config.empty()) {
@@ -1583,21 +1751,18 @@ class GroupConnectedBoundaries {
 
  public:
   explicit GroupConnectedBoundaries(
-      HloInstruction* conditional, bool is_layout_sensitive,
+      HloInstruction* conditional, bool is_layout_sensitive, bool has_outfeed,
       absl::flat_hash_map<HloInstruction*, int>& visited_count,
+      absl::flat_hash_map<const HloInstruction*, int>& non_leaf_operand_count,
       std::vector<std::vector<int64_t>>* move_config,
       std::vector<std::vector<int64_t>>* reuse_config,
       std::vector<int64_t>& search_config)
       : conditional_(conditional),
         conditional_parent_(conditional->parent()),
         is_layout_sensitive_(is_layout_sensitive),
-        has_outfeed_(absl::c_any_of(
-            conditional->called_computations(),
-            [](HloComputation* computation) {
-              return absl::c_any_of(computation->instructions(),
-                                    HloPredicateIsOp<HloOpcode::kOutfeed>);
-            })),
+        has_outfeed_(has_outfeed),
         visited_count_(visited_count),
+        non_leaf_operand_count_(non_leaf_operand_count),
         move_config_(*move_config),
         reuse_config_(*reuse_config),
         search_config_vec_(EnsureSearchConfig(search_config)),
@@ -1609,6 +1774,13 @@ class GroupConnectedBoundaries {
   // instructions. Use different integers to classify different levels
   // of reuses. Assume all instructions can be fused to enable data reuses.
   int64_t ReusesCarriedBy(HloInstruction* op, HloInstruction* user) {
+    // Side-effecting instructions can't be fused (see
+    // HloInstruction::IsFusible), so a side-effecting custom-call user carries
+    // no reuse.
+    if (user->opcode() == HloOpcode::kCustomCall &&
+        Cast<HloCustomCallInstruction>(user)->custom_call_has_side_effect()) {
+      return 0;
+    }
     std::vector<int64_t>& curconfig =
         reuse_config_[static_cast<uint32_t>(op->opcode())];
     // Flip the reuse configuration if tuning the cost model.
@@ -1626,8 +1798,8 @@ class GroupConnectedBoundaries {
             << "\n";
     if (config < 0) {
       // Assume the reuse decreases with increasing user count.
-      int count1 = CountNonLeafOps(op->users());
-      int count2 = CountNonLeafOps(user->operands());
+      int count1 = op->user_count();
+      int count2 = NonLeafOperandCount(user);
       return (-config) / count1 / count2;
     }
     return config;
@@ -1991,11 +2163,10 @@ class GroupConnectedBoundaries {
   // dependent already considered for moving.
   bool IsSafeToMoveBoundary(const Boundary& next_boundary) {
     VLOG(1) << "Check is safe to move boundary.\n";
-    int64_t next_boundary_count =
-        (next_boundary.IsInsideBranch() ||
-         next_boundary.IsOutsideBranchOperand())
-            ? next_boundary[0]->user_count()
-            : CountNonLeafOps(next_boundary[0]->operands());
+    int64_t next_boundary_count = (next_boundary.IsInsideBranch() ||
+                                   next_boundary.IsOutsideBranchOperand())
+                                      ? next_boundary[0]->user_count()
+                                      : NonLeafOperandCount(next_boundary[0]);
     if (next_boundary_count <= 1) {
       if (next_boundary.IsOutsideBranchOperand() &&
           next_boundary[0]->users()[0] == conditional_ &&
@@ -2152,13 +2323,27 @@ class GroupConnectedBoundaries {
   }
 };
 
+// State of the boundary analysis of one conditional. The HLO does not change
+// while a conditional is analyzed, so the facts cached here stay valid until
+// the decision for the conditional is applied.
+struct ConditionalCodeMotion::ConditionalAnalysisState {
+  // Whether a branch of the conditional contains an outfeed.
+  bool has_outfeed = false;
+  // Number of times each instruction has been visited for moving.
+  absl::flat_hash_map<HloInstruction*, int> visited_count;
+  // Number of distinct operands of an instruction that are not constants, by
+  // instruction.
+  absl::flat_hash_map<const HloInstruction*, int> non_leaf_operand_count;
+};
+
 ConditionalCodeMotion::Decision ConditionalCodeMotion::ConsiderCodeMotion(
     HloInstruction* conditional, const Boundary& cur_boundary,
     std::vector<Boundary>& to_move, std::vector<Boundary>& new_boundaries,
-    absl::flat_hash_map<HloInstruction*, int>& visited_count) {
-  GroupConnectedBoundaries connect(conditional, is_layout_sensitive_,
-                                   visited_count, &move_config_, &reuse_config_,
-                                   search_config_);
+    ConditionalAnalysisState& analysis) {
+  GroupConnectedBoundaries connect(
+      conditional, is_layout_sensitive_, analysis.has_outfeed,
+      analysis.visited_count, analysis.non_leaf_operand_count, &move_config_,
+      &reuse_config_, search_config_);
   auto move_in_or_out =
       connect.BoundariesToMoveInOrOut(conditional, cur_boundary);
   if (!move_in_or_out.first.empty()) {
@@ -2281,8 +2466,14 @@ absl::StatusOr<bool> ConditionalCodeMotion::RunImpl(
     std::vector<std::vector<Boundary>> to_move_out, to_move_in;
     std::vector<std::vector<Boundary>> new_boundaries_for_moveout;
     std::vector<std::vector<Boundary>> new_boundaries_for_movein;
-    // Number of times each instruction has been visited for moving.
-    absl::flat_hash_map<HloInstruction*, int> visited_count;
+    // Shared by the analyses of all boundaries of this conditional.
+    ConditionalAnalysisState analysis;
+    analysis.has_outfeed = absl::c_any_of(
+        conditional->called_computations(),
+        [](const HloComputation* computation) {
+          return absl::c_any_of(computation->instructions(),
+                                HloPredicateIsOp<HloOpcode::kOutfeed>);
+        });
     int benefit_move_out = 0, benefit_move_in = 0;
     Decision::Direction final_d = Decision::Direction::kNoChange;
     // The conditional is moved into a worklist as the seed (starting point).
@@ -2301,7 +2492,7 @@ absl::StatusOr<bool> ConditionalCodeMotion::RunImpl(
       Boundary boundary = visitor.PopNextBoundary();
       VLOG(2) << "Analyzing boundary:" << boundary.ToString() << "\n";
       auto d = ConsiderCodeMotion(conditional, boundary, to_move, next_boundary,
-                                  visited_count);
+                                  analysis);
       switch (d.GetDirection()) {
         case Decision::Direction::kMoveOutOfBranch:
           VLOG(2) << "Local Decision is move out of branch\n";

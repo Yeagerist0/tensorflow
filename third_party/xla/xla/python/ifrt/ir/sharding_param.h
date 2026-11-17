@@ -23,7 +23,6 @@ limitations under the License.
 
 #include "absl/container/inlined_vector.h"
 #include "absl/status/status.h"
-#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Hashing.h"
@@ -34,9 +33,6 @@ limitations under the License.
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Support/LogicalResult.h"
-#include "xla/python/ifrt/ir/sharding_param.pb.h"
-#include "xla/python/ifrt/serdes_default_version_accessor.h"
-#include "xla/python/ifrt/serdes_version.h"
 
 namespace xla {
 namespace ifrt {
@@ -128,18 +124,9 @@ class ShardingParam {
 
   static mlir::FailureOr<ShardingParam> Parse(mlir::AsmParser& ods_parser);
 
-  // Parses V1 of ShardingParam. This method is meant to be used in the VIFRT
-  // dialect to parse versioned ShardingParams.
-  static mlir::FailureOr<ShardingParam> ParseV1(mlir::AsmParser& ods_parser);
-
   // Parses V2 of ShardingParam. This method is meant to be used in the VIFRT
   // dialect to parse versioned ShardingParams.
   static mlir::FailureOr<ShardingParam> ParseV2(mlir::AsmParser& ods_parser);
-
-  // Prints V1 of ShardingParam. This method is meant to be used in the VIFRT
-  // dialect to print versioned ShardingParams.
-  static void PrintV1(mlir::AsmPrinter& ods_printer,
-                      const ShardingParam& sharding);
 
   // Prints V2 of ShardingParam. This method is meant to be used in the VIFRT
   // dialect to print versioned ShardingParams.
@@ -150,7 +137,7 @@ class ShardingParam {
   mlir::LogicalResult verify(
       llvm::function_ref<mlir::InFlightDiagnostic()> emit_error) const;
 
-  // Verifies if the sharding can be applied to the array.
+  // Verifies if a validated sharding can be applied to the array.
   mlir::LogicalResult CanApplyTo(
       llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
       mlir::RankedTensorType shape, llvm::ArrayRef<int> device_ids) const;
@@ -199,23 +186,6 @@ class ShardingParam {
   }
 
   std::string DebugString() const;
-
-  // Converts this sharding param to a protobuf.
-  absl::Status ToProto(
-      ShardingParamProto& proto,
-      SerDesVersion version = SerDesDefaultVersionAccessor::Get()) const;
-
-  // Returns a `ShardingParamProto` representation.
-  absl::StatusOr<ShardingParamProto> ToProto(
-      SerDesVersion version = SerDesDefaultVersionAccessor::Get()) const {
-    ShardingParamProto proto;
-    ABSL_RETURN_IF_ERROR(ToProto(proto, version));
-    return proto;
-  }
-
-  // Constructs `ShardingParam` from `ShardingParamProto`.
-  static absl::StatusOr<ShardingParam> FromProto(
-      const ShardingParamProto& proto);
 
  private:
   std::vector<int64_t> dim_shards_;

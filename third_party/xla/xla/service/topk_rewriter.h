@@ -22,8 +22,10 @@ limitations under the License.
 #include <utility>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "xla/comparison_util.h"
 #include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -38,7 +40,7 @@ namespace xla {
 class TopkRewriter : public HloModulePass {
  public:
   explicit TopkRewriter(std::function<bool(const HloSortInstruction*, int64_t)>
-                            is_profitable_to_convert)
+                            is_profitable_to_convert = {})
       : is_profitable_to_convert_(std::move(is_profitable_to_convert)) {}
 
   absl::string_view name() const override { return "topk-rewriter"; }
@@ -49,7 +51,16 @@ class TopkRewriter : public HloModulePass {
       const absl::flat_hash_set<absl::string_view>& execution_threads) override;
 
   // Check if the sort instruction is in TopK.
-  std::optional<int64_t> SortIsInTopK(HloInstruction* inst);
+  std::optional<int64_t> SortIsInTopK(HloInstruction* inst,
+                                      ComparisonOrder* order = nullptr,
+                                      bool* is_stable_expanded = nullptr);
+
+  // Replaces `slice` with `topk_output` when `slice` starts at 0 (so its
+  // dimensions match `topk_output`), or retargets operand 0 of `slice` to
+  // `topk_output` when `slice` has a non-zero start index (so its dimensions
+  // differ from `topk_output`).
+  static absl::Status ReplaceSliceWithTopKOutput(HloInstruction* slice,
+                                                 HloInstruction* topk_output);
 
   // Transform to CustomCall.
   absl::StatusOr<bool> TransformToCustomCall(

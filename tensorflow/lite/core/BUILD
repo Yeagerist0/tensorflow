@@ -351,6 +351,26 @@ cc_library(
 
 # Test signature runner.
 cc_test(
+    name = "interpreter_builder_specialization_test",
+    size = "small",
+    srcs = ["interpreter_builder_specialization_test.cc"],
+    data = [
+        "//tensorflow/lite:testdata/multi_signatures.bin",
+        "//tensorflow/lite:testdata/no_signatures.bin",
+        "//tensorflow/lite:testdata/no_signatures_no_tensor_names.bin",
+    ],
+    deps = [
+        ":framework",
+        ":signature_runner",
+        "//tensorflow/lite:model_builder",
+        "//tensorflow/lite/core/c:common",
+        "//tensorflow/lite/core/kernels:builtin_ops",
+        "//tensorflow/lite/testing:util",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "signature_runner_test",
     size = "small",
     srcs = ["signature_runner_test.cc"],
@@ -364,10 +384,13 @@ cc_test(
         ":framework",
         ":signature_runner",
         "//tensorflow/compiler/mlir/lite/core:model_builder_base",
+        "//tensorflow/lite:interpreter_options_header",
         "//tensorflow/lite:model_builder",
         "//tensorflow/lite/core/kernels:builtin_ops",
+        "//tensorflow/lite/schema:schema_fbs",
         "//tensorflow/lite/testing:util",
         "@com_google_googletest//:gtest_main",
+        "@flatbuffers//:runtime_cc",
     ],
 )
 

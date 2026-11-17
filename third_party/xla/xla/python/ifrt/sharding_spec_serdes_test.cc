@@ -20,21 +20,28 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
-#include "xla/python/ifrt/ir/sharding_param.h"
+#include "xla/python/ifrt/device_list.h"
+#include "xla/python/ifrt/device_test_util.h"
+#include "xla/python/ifrt/memory.h"
 #include "xla/python/ifrt/serdes.h"
 #include "xla/python/ifrt/serdes.pb.h"
 #include "xla/python/ifrt/serdes_test_util.h"
 #include "xla/python/ifrt/serdes_version.h"
 #include "xla/python/ifrt/shape.h"
+#include "xla/python/ifrt/sharding.h"
 #include "xla/python/ifrt/sharding_spec.h"
-#include "xla/tsl/platform/statusor.h"
+#include "xla/python/ifrt/sharding_spec_serdes.pb.h"
 
 namespace xla {
 namespace ifrt {
 namespace {
 
+using ::absl_testing::StatusIs;
 using ::testing::ElementsAreArray;
+using ::testing::HasSubstr;
 
 using ShardingSpecSerDesTestParam = std::tuple<SerDesVersion, int>;
 
@@ -48,11 +55,11 @@ class ShardingSpecSerDesTest
 TEST_P(ShardingSpecSerDesTest, SingleDeviceShardingSpecRoundTrip) {
   auto sharding_spec = SingleDeviceShardingSpec::Create();
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto serialized,
       Serialize(*sharding_spec, std::make_unique<SerializeOptions>(version())));
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto out_sharding_spec,
       Deserialize<SingleDeviceShardingSpec>(serialized, /*options=*/nullptr));
 }
@@ -61,10 +68,10 @@ TEST_P(ShardingSpecSerDesTest, OpaqueShardingSpecRoundTrip) {
   auto sharding_spec = OpaqueShardingSpec::Create(num_shards());
 
   auto options = std::make_unique<SerializeOptions>(version());
-  TF_ASSERT_OK_AND_ASSIGN(auto serialized,
-                          Serialize(*sharding_spec, std::move(options)));
+  ASSERT_OK_AND_ASSIGN(auto serialized,
+                       Serialize(*sharding_spec, std::move(options)));
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto out_sharding_spec,
       Deserialize<OpaqueShardingSpec>(serialized, /*options=*/nullptr));
 
@@ -78,10 +85,10 @@ TEST_P(ShardingSpecSerDesTest, ConcreteShardingSpecRoundTrip) {
                                    /*shard_shapes=*/shard_shapes);
 
   auto options = std::make_unique<SerializeOptions>(version());
-  TF_ASSERT_OK_AND_ASSIGN(auto serialized,
-                          Serialize(*sharding_spec, std::move(options)));
+  ASSERT_OK_AND_ASSIGN(auto serialized,
+                       Serialize(*sharding_spec, std::move(options)));
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto out_sharding_spec,
       Deserialize<ConcreteShardingSpec>(serialized, /*options=*/nullptr));
 
@@ -92,13 +99,13 @@ TEST_P(ShardingSpecSerDesTest, ConcreteShardingSpecRoundTrip) {
 }
 
 TEST_P(ShardingSpecSerDesTest, ConcreteShardingSpecWithDynamicShapeRoundTrip) {
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       DynamicShape shard_dynamic_shape,
       DynamicShape::Create(Shape({10, 20}),
                            BoundedDynamicShapeTag({false, true})));
   std::vector<DynamicShape> shard_dynamic_shapes(num_shards(),
                                                  shard_dynamic_shape);
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       DynamicShape dynamic_shape,
       DynamicShape::Create(Shape({10 * num_shards(), 20}),
                            BoundedDynamicShapeTag({false, true})));
@@ -107,10 +114,10 @@ TEST_P(ShardingSpecSerDesTest, ConcreteShardingSpecWithDynamicShapeRoundTrip) {
       /*shard_dynamic_shapes=*/shard_dynamic_shapes);
 
   auto options = std::make_unique<SerializeOptions>(version());
-  TF_ASSERT_OK_AND_ASSIGN(auto serialized,
-                          Serialize(*sharding_spec, std::move(options)));
+  ASSERT_OK_AND_ASSIGN(auto serialized,
+                       Serialize(*sharding_spec, std::move(options)));
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto out_sharding_spec,
       Deserialize<ConcreteShardingSpec>(serialized, /*options=*/nullptr));
 
@@ -128,10 +135,10 @@ TEST_P(ShardingSpecSerDesTest, ConcreteEvenShardingSpecRoundTrip) {
       /*shard_shape=*/Shape({10, 20}), /*is_fully_replicated=*/false);
 
   auto options = std::make_unique<SerializeOptions>(version());
-  TF_ASSERT_OK_AND_ASSIGN(auto serialized,
-                          Serialize(*sharding_spec, std::move(options)));
+  ASSERT_OK_AND_ASSIGN(auto serialized,
+                       Serialize(*sharding_spec, std::move(options)));
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto out_sharding_spec,
       Deserialize<ConcreteEvenShardingSpec>(serialized, /*options=*/nullptr));
 
@@ -142,41 +149,76 @@ TEST_P(ShardingSpecSerDesTest, ConcreteEvenShardingSpecRoundTrip) {
               sharding_spec->IsFullyReplicated());
 }
 
-TEST_P(ShardingSpecSerDesTest, ShardingParamShardingSpecRoundTrip) {
-  auto sharding_spec = ShardingParamShardingSpec::Create(
-      ShardingParam({num_shards(), 1}, {{0}, {num_shards()}}));
-
-  auto options = std::make_unique<SerializeOptions>(version());
-  TF_ASSERT_OK_AND_ASSIGN(auto serialized,
-                          Serialize(*sharding_spec, std::move(options)));
-  TF_ASSERT_OK_AND_ASSIGN(
-      auto out_sharding_spec,
-      Deserialize<ShardingParamShardingSpec>(serialized, /*options=*/nullptr));
-
-  EXPECT_THAT(out_sharding_spec->num_shards(), sharding_spec->num_shards());
-  EXPECT_THAT(out_sharding_spec->sharding_param(),
-              sharding_spec->sharding_param());
+TEST_P(ShardingSpecSerDesTest, RejectZeroOrNegativeNumShards) {
+  {
+    OpaqueShardingSpecProto proto;
+    proto.set_version_number(SerDesVersionNumber(0).value());
+    proto.set_num_shards(0);
+    Serialized wrapper;
+    wrapper.set_type_name("xla::ifrt::OpaqueShardingSpec");
+    wrapper.set_data(proto.SerializeAsString());
+    EXPECT_THAT(Deserialize<OpaqueShardingSpec>(wrapper, /*options=*/nullptr),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("requires at least 1 shard")));
+  }
+  {
+    ConcreteShardingSpecProto proto;
+    proto.set_version_number(SerDesVersionNumber(0).value());
+    Shape({0}).ToProto(*proto.mutable_shape(), version());
+    Serialized wrapper;
+    wrapper.set_type_name("xla::ifrt::ConcreteShardingSpec");
+    wrapper.set_data(proto.SerializeAsString());
+    EXPECT_THAT(Deserialize<ConcreteShardingSpec>(wrapper, /*options=*/nullptr),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("requires at least 1 shard shape")));
+  }
+  {
+    ConcreteEvenShardingSpecProto proto;
+    proto.set_version_number(SerDesVersionNumber(0).value());
+    proto.set_num_shards(-1);
+    Shape({10}).ToProto(*proto.mutable_shape(), version());
+    Shape({10}).ToProto(*proto.mutable_shard_shape(), version());
+    Serialized wrapper;
+    wrapper.set_type_name("xla::ifrt::ConcreteEvenShardingSpec");
+    wrapper.set_data(proto.SerializeAsString());
+    EXPECT_THAT(
+        Deserialize<ConcreteEvenShardingSpec>(wrapper, /*options=*/nullptr),
+        StatusIs(absl::StatusCode::kInvalidArgument,
+                 HasSubstr("requires at least 1 shard")));
+  }
 }
 
 TEST_P(ShardingSpecSerDesTest,
-       ShardingParamShardingSpecWithUnreducedDimsRoundTrip) {
-  if (version().version_number() < SerDesVersionNumber(1)) {
-    GTEST_SKIP() << "Unreduced dims not supported before version 1.";
+       RejectPartialAddressableConcreteShardingSpecSerialization) {
+  test_util::DeviceTestFixture fixture(test_util::DeviceTestParam{
+      /*num_devices=*/6, /*num_addressable_devices=*/4});
+  DeviceListRef devices = fixture.GetDevices({0, 1, 2, 3, 4, 5});
+  {
+    std::unique_ptr<ConcreteSharding> sharding = ConcreteSharding::Create(
+        devices, MemoryKind(), /*shape=*/Shape({20}),
+        /*shard_shapes=*/{Shape({3}), Shape({7}), Shape({3}), Shape({7})});
+    EXPECT_THAT(Serialize(*sharding->sharding_spec(),
+                          std::make_unique<SerializeOptions>(version())),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("partial addressable shard shapes cannot be "
+                                   "serialized")));
   }
-  auto sharding_spec = ShardingParamShardingSpec::Create(
-      ShardingParam({1, 1}, {{0}, {num_shards()}},
-                    /*unreduced_axes=*/{0}));
-
-  auto options = std::make_unique<SerializeOptions>(version());
-  TF_ASSERT_OK_AND_ASSIGN(Serialized serialized,
-                          Serialize(*sharding_spec, std::move(options)));
-  TF_ASSERT_OK_AND_ASSIGN(
-      auto out_sharding_spec,
-      Deserialize<ShardingParamShardingSpec>(serialized, /*options=*/nullptr));
-
-  EXPECT_THAT(out_sharding_spec->num_shards(), sharding_spec->num_shards());
-  EXPECT_THAT(out_sharding_spec->sharding_param(),
-              sharding_spec->sharding_param());
+  {
+    ASSERT_OK_AND_ASSIGN(
+        DynamicShape dynamic_shape,
+        DynamicShape::Create(Shape({20}), BoundedDynamicShapeTag({true})));
+    ASSERT_OK_AND_ASSIGN(
+        DynamicShape shard_dynamic_shape,
+        DynamicShape::Create(Shape({5}), BoundedDynamicShapeTag({true})));
+    std::unique_ptr<ConcreteSharding> sharding = ConcreteSharding::Create(
+        devices, MemoryKind(), dynamic_shape,
+        std::vector<DynamicShape>(4, shard_dynamic_shape));
+    EXPECT_THAT(Serialize(*sharding->sharding_spec(),
+                          std::make_unique<SerializeOptions>(version())),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("partial addressable shard shapes cannot be "
+                                   "serialized")));
+  }
 }
 
 INSTANTIATE_TEST_SUITE_P(

@@ -32,12 +32,11 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/buffer_debug_log.pb.h"
 #include "xla/backends/gpu/runtime/buffer_debug_log_entry_metadata_store.h"
 #include "xla/backends/gpu/runtime/buffer_debug_log_structs.h"
-#include "xla/backends/gpu/runtime/collective_clique_requests.h"
-#include "xla/backends/gpu/runtime/collective_memory_requests.h"
 #include "xla/backends/gpu/runtime/collective_params.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk.pb.h"
 #include "xla/backends/gpu/runtime/thunk_id.h"
+#include "xla/backends/gpu/runtime/thunk_test_utils.h"
 #include "xla/runtime/device_id.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/gpu/buffer_allocations.h"
@@ -50,8 +49,6 @@ limitations under the License.
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor_memory_allocator.h"
-#include "xla/tsl/lib/core/status_test_util.h"
-#include "xla/tsl/platform/statusor.h"
 
 namespace xla::gpu {
 namespace {
@@ -107,10 +104,10 @@ class BuffersDebugChecksumThunkTest : public ::testing::Test {
   void SetUp() override {
     std::string name = absl::AsciiStrToUpper(
         xla::PlatformUtil::CanonicalPlatformName("gpu").value());
-    TF_ASSERT_OK_AND_ASSIGN(platform_,
-                            se::PlatformManager::PlatformWithName(name));
-    TF_ASSERT_OK_AND_ASSIGN(executor_, platform_->ExecutorForDevice(0));
-    TF_ASSERT_OK_AND_ASSIGN(stream_, executor_->CreateStream(std::nullopt));
+    ASSERT_OK_AND_ASSIGN(platform_,
+                         se::PlatformManager::PlatformWithName(name));
+    ASSERT_OK_AND_ASSIGN(executor_, platform_->ExecutorForDevice(0));
+    ASSERT_OK_AND_ASSIGN(stream_, executor_->CreateStream(std::nullopt));
     allocator_ =
         std::make_unique<stream_executor::StreamExecutorAddressAllocator>(
             stream_->parent());
@@ -156,50 +153,40 @@ TEST_F(BuffersDebugChecksumThunkTest, CalculatesChecksums) {
   se::DeviceAddressBase inputs0_mem = allocations.GetDeviceAddress(inputs[0]);
   se::DeviceAddressBase inputs1_mem = allocations.GetDeviceAddress(inputs[1]);
   // Initialize the log in device memory
-  TF_ASSERT_OK_AND_ASSIGN(auto device_log,
-                          BufferDebugLog<BufferDebugLogEntry>::CreateOnDevice(
-                              *stream_, se::DeviceAddress<uint8_t>(log_mem)));
+  ASSERT_OK_AND_ASSIGN(auto device_log,
+                       BufferDebugLog<BufferDebugLogEntry>::CreateOnDevice(
+                           *stream_, se::DeviceAddress<uint8_t>(log_mem)));
   // Fill inputs with some data
   std::vector<uint32_t> zeros(1024, 0);
   zeros[123] = 12341234;  // expected checksum for inputs_mem[0]
-  TF_ASSERT_OK(stream_->Memcpy(&inputs0_mem, zeros.data(), zeros.size()));
+  ASSERT_OK(stream_->Memcpy(&inputs0_mem, zeros.data(), zeros.size()));
   zeros[123] = 56785678;  // expected checksum for inputs_mem[1]
-  TF_ASSERT_OK(stream_->Memcpy(&inputs1_mem, zeros.data(), zeros.size()));
+  ASSERT_OK(stream_->Memcpy(&inputs1_mem, zeros.data(), zeros.size()));
 
   // Setup parameters for Initialize/Prepare/ExecuteOnStream
-  Thunk::InitializeParams init_params;
-  init_params.executor = executor_;
-  init_params.stream = stream_.get();
-
   ServiceExecutableRunOptions run_options;
   run_options.mutable_run_options()->set_stream(stream_.get());
   ASSERT_OK_AND_ASSIGN(
       CollectiveParams collective_params,
       CollectiveParams::Create(run_options, /*async_streams=*/{},
                                LocalDeviceId(executor_->device_ordinal())));
-  CollectiveCliqueRequests clique_requests;
-  CollectiveMemoryRequests memory_requests(allocations);
-  Thunk::PrepareParams prepare_params{&collective_params, &clique_requests,
-                                      &memory_requests, executor_,
-                                      &allocations};
+  TestThunkParams thunk_params(executor_, &allocations, stream_.get());
+  thunk_params.WithCommandBufferTraceStream(stream_.get())
+      .WithCollectiveParams(&collective_params);
 
-  Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), allocations, stream_.get(),
-      /*command_buffer_trace_stream=*/stream_.get(),
-      /*collective_params=*/nullptr, /*collective_cliques=*/nullptr,
-      /*collective_memory=*/nullptr);
   auto metadata_store = std::make_shared<BufferDebugLogEntryMetadataStore>();
 
   BuffersDebugChecksumThunk thunk(
       Thunk::ThunkInfo(), log_slice,
       /*checked_thunk_id=*/ThunkId(123),
       {{/*buffer_idx=*/0, inputs[0]}, {/*buffer_idx=*/1, inputs[1]}},
-      /*runs_before_checked_thunk=*/true, metadata_store);
-  TF_ASSERT_OK(thunk.Initialize(init_params));
-  TF_ASSERT_OK(thunk.Prepare(prepare_params));
-  TF_ASSERT_OK(thunk.ExecuteOnStream(execute_params));
-  TF_ASSERT_OK_AND_ASSIGN(std::vector<BufferDebugLogEntry> entries,
-                          device_log.ReadFromDevice(*stream_));
+      /*runs_before_checked_thunk=*/true, metadata_store,
+      /*devices_per_host=*/1);
+  ASSERT_OK(thunk.Initialize(thunk_params.InitializeParams()));
+  ASSERT_OK(thunk.Prepare(thunk_params.PrepareParams()));
+  ASSERT_OK(thunk.ExecuteOnStream(thunk_params.ExecuteParams()));
+  ASSERT_OK_AND_ASSIGN(std::vector<BufferDebugLogEntry> entries,
+                       device_log.ReadFromDevice(*stream_));
 
   // BuffersDebugChecksumThunk launches a kernel for each input buffer, they may
   // complete in any order.
@@ -261,8 +248,8 @@ TEST_F(BuffersDebugChecksumThunkTest,
     return TestDevice{std::move(executor), std::move(stream),
                       std::move(allocator), std::move(allocations)};
   };
-  TF_ASSERT_OK_AND_ASSIGN(TestDevice device0, setup_device(0));
-  TF_ASSERT_OK_AND_ASSIGN(TestDevice device1, setup_device(1));
+  ASSERT_OK_AND_ASSIGN(TestDevice device0, setup_device(0));
+  ASSERT_OK_AND_ASSIGN(TestDevice device1, setup_device(1));
   BufferAllocation allocation(0, kLogSizeBytes + kInputSizeBytes, 0);
   BufferAllocation::Slice log_slice(&allocation, 0, kLogSizeBytes);
   BufferAllocation::Slice input_slice(&allocation, kLogSizeBytes,
@@ -271,29 +258,26 @@ TEST_F(BuffersDebugChecksumThunkTest,
       Thunk::ThunkInfo(), log_slice,
       /*checked_thunk_id=*/ThunkId(123), {{/*buffer_idx=*/0, input_slice}},
       /*runs_before_checked_thunk=*/true,
-      std::make_shared<BufferDebugLogEntryMetadataStore>());
+      std::make_shared<BufferDebugLogEntryMetadataStore>(),
+      /*devices_per_host=*/2);
 
   // Initialize the Thunk on both devices and run the kernel. An attempt to run
   // a kernel on the wrong device will fail with CUDA_ERROR_INVALID_HANDLE. The
   // error may be reported from the next operation on the stream, so assert on
   // BlockHostUntilDone as well.
-  TF_ASSERT_OK(
-      thunk.Initialize(Thunk::InitializeParams{/*executor=*/device0.executor}));
-  TF_ASSERT_OK(thunk.ExecuteOnStream(Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), device0.allocations, device0.stream.get(),
-      /*command_buffer_trace_stream=*/device0.stream.get(),
-      /*collective_params=*/nullptr,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr)));
-  TF_ASSERT_OK(device0.stream->BlockHostUntilDone());
+  TestThunkParams params0(device0.executor, &device0.allocations,
+                          device0.stream.get());
+  params0.WithCommandBufferTraceStream(device0.stream.get());
+  ASSERT_OK(thunk.Initialize(params0.InitializeParams()));
+  ASSERT_OK(thunk.ExecuteOnStream(params0.ExecuteParams()));
+  ASSERT_OK(device0.stream->BlockHostUntilDone());
 
-  TF_ASSERT_OK(
-      thunk.Initialize(Thunk::InitializeParams{/*executor=*/device1.executor}));
-  TF_ASSERT_OK(thunk.ExecuteOnStream(Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), device1.allocations, device1.stream.get(),
-      /*command_buffer_trace_stream=*/device1.stream.get(),
-      /*collective_params=*/nullptr,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr)));
-  TF_ASSERT_OK(device1.stream->BlockHostUntilDone());
+  TestThunkParams params1(device1.executor, &device1.allocations,
+                          device1.stream.get());
+  params1.WithCommandBufferTraceStream(device1.stream.get());
+  ASSERT_OK(thunk.Initialize(params1.InitializeParams()));
+  ASSERT_OK(thunk.ExecuteOnStream(params1.ExecuteParams()));
+  ASSERT_OK(device1.stream->BlockHostUntilDone());
 }
 
 }  // namespace

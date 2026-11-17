@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "xla/hlo/analysis/alias_info.h"
 #include "xla/hlo/analysis/hlo_alias_analysis.h"
+#include "xla/hlo/analysis/hlo_dataflow_analysis.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
@@ -85,6 +86,19 @@ class CopyInsertion : public HloModulePass {
             use_region_based_live_range_analysis),
         view_color_(view_color) {}
 
+  // When enabled, the copy added for the operand of an in-place operation is
+  // ordered (via control dependencies) after the other readers of that operand
+  // that are already predecessors of the in-place operation. This does not
+  // constrain the schedule beyond what the in-place operation already
+  // requires, but lets RemoveUnnecessaryCopies elide copies in chains of
+  // "read, then update in place" steps on the same buffer, e.g. gather +
+  // scatter updates of a loop-carried table across unrolled loop steps, where
+  // the copies would otherwise block each other's removal. Copies that are not
+  // removed keep these control dependencies.
+  void set_order_predecessor_readers_before_in_place_copies(bool enabled) {
+    order_predecessor_readers_before_in_place_copies_ = enabled;
+  }
+
   // Try to remove as many copies from the module as possible without
   // introducing live range interference. Only copy instructions that are
   // eligible for copy elision are considered for removal.
@@ -136,15 +150,14 @@ class CopyInsertion : public HloModulePass {
 
   // Add copies for conditional instructions.
   virtual absl::Status AddCopiesForConditional(
-      const HloAliasAnalysis& alias_analysis, HloInstruction* conditional);
+      const HloDataflowAnalysis& dataflow, HloInstruction* conditional);
 
   // Adds copies for transitioning into and out of non-copyable values.
-  absl::Status AddCopiesForNonCopyableTransitions(
-      const HloAliasAnalysis& alias_analysis, HloInstruction* chain_start);
+  absl::Status AddCopiesForNonCopyableTransitions(HloInstruction* chain_start);
   // Adds copies for transitioning into and out of non-copyable values for a
   // explicit non-copyable chain.
   absl::Status AddCopiesForExplicitNonCopyableTransitions(
-      const HloAliasAnalysis& alias_analysis, HloInstruction* chain_start);
+      HloInstruction* chain_start);
 
   // Backend specific information about whether an instruction can share buffer
   // with its operand.
@@ -160,11 +173,18 @@ class CopyInsertion : public HloModulePass {
       const absl::flat_hash_set<absl::string_view>& execution_threads) override;
 
  private:
+  friend class CopyInsertionTestPeer;
+
   absl::Status AddCopiesToResolveInterference(
+      HloModule* module,
+      const absl::flat_hash_set<absl::string_view>& execution_threads);
+  // See set_order_predecessor_readers_before_in_place_copies.
+  absl::Status OrderPredecessorReadersBeforeInPlaceCopies(
       HloModule* module,
       const absl::flat_hash_set<absl::string_view>& execution_threads);
   int64_t use_region_based_live_range_analysis_;
   std::optional<int64_t> view_color_;
+  bool order_predecessor_readers_before_in_place_copies_ = false;
 };
 
 }  // namespace xla

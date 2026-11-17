@@ -36,19 +36,23 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "xla/backends/cpu/target_machine_options.h"
 #include "xla/backends/gpu/ffi.h"
-#include "xla/backends/gpu/runtime/collective_clique_requests.h"
-#include "xla/backends/gpu/runtime/collective_memory_requests.h"
 #include "xla/backends/gpu/runtime/collective_params.h"
 #include "xla/backends/gpu/runtime/command.h"
+#include "xla/backends/gpu/runtime/command_buffer_requests.h"
 #include "xla/backends/gpu/runtime/command_state.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk.pb.h"
+#include "xla/backends/gpu/runtime/thunk_test_utils.h"
+#include "xla/custom_options.h"
 #include "xla/executable_run_options.h"
+#include "xla/ffi/api/kernel_api.h"
+#include "xla/ffi/api/kernel_c_api.h"
 #include "xla/ffi/api/record_api.h"
 #include "xla/ffi/api/record_c_api.h"
 #include "xla/ffi/attribute_map.h"
 #include "xla/ffi/execution_state.h"
 #include "xla/ffi/ffi.h"
+#include "xla/ffi/kernel_registry_ffi.h"
 #include "xla/ffi/record_ffi.h"
 #include "xla/ffi/type_registry.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -66,13 +70,13 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/gpu/gpu_test_kernels.h"
+#include "xla/stream_executor/gpu/gpu_test_kernels_fatbin.h"
+#include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor_address_allocator.h"
-#include "xla/tsl/lib/core/status_test_util.h"
-#include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/util/proto/parse_text_proto.h"
 #include "xla/xla_data.pb.h"
 
@@ -168,6 +172,21 @@ XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), kReturnErrorCustomCallName,
 XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), kReturnErrorCustomCallName,
                          "SYCL", kReturnError);
 
+TEST(CustomCallThunkTest, ToStringIncludesPdlOnlyWhenEnabled) {
+  for (bool use_pdl : {false, true}) {
+    ASSERT_OK_AND_ASSIGN(
+        auto thunk,
+        CustomCallThunk::Create(
+            Thunk::ThunkInfo(), std::string(kReturnErrorCustomCallName),
+            /*operands=*/{}, /*results=*/{}, /*attributes=*/{},
+            /*called_computation=*/nullptr, /*platform_name=*/"CUDA",
+            se::GpuComputeCapability(), /*execution_state=*/nullptr,
+            /*cpu_target_machine_options=*/std::nullopt, use_pdl));
+    EXPECT_EQ(thunk->ToString(0),
+              use_pdl ? "kCustomCall, use_pdl=true" : "kCustomCall");
+  }
+}
+
 TEST(CustomCallThunkTest, ResolvesFFICustomCall) {
   ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor, GpuExecutor());
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
@@ -187,12 +206,10 @@ TEST(CustomCallThunkTest, ResolvesFFICustomCall) {
 
   stream_executor::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations empty_unused_allocations({}, 0, &allocator);
-  Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), empty_unused_allocations,
-      /*stream=*/stream.get(),
-      /*command_buffer_trace_stream=*/stream.get(),
-      /*collective_params=*/nullptr,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &empty_unused_allocations,
+                               stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get());
+  Thunk::ExecuteParams params = thunk_params.ExecuteParams();
   EXPECT_THAT(thunk->ExecuteOnStream(params),
               StatusIs(absl::StatusCode::kUnknown,
                        HasSubstr("Custom call was executed!")));
@@ -202,32 +219,48 @@ TEST(CustomCallThunkTest, CustomCallWithOwnedHandlers) {
   ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor, GpuExecutor());
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
                        executor->CreateStream());
+  auto options = std::make_shared<const xla::CustomOptions>(
+      xla::CustomOptions::Map{{"value", int64_t{42}}});
   int instantiate_calls = 0;
   int prepare_calls = 0;
   int initialize_calls = 0;
   int execute_calls = 0;
   CustomCallThunk::OwnedHandlerBundle bundle;
-  bundle.instantiate =
-      ffi::Ffi::Bind<ffi::ExecutionStage::kInstantiate>().To([&]() {
-        ++instantiate_calls;
-        return absl::OkStatus();
-      });
-  bundle.prepare = ffi::Ffi::Bind<ffi::ExecutionStage::kPrepare>().To([&]() {
-    ++prepare_calls;
-    return absl::OkStatus();
-  });
-  bundle.initialize =
-      ffi::Ffi::Bind<ffi::ExecutionStage::kInitialize>().To([&]() {
-        ++initialize_calls;
-        return absl::OkStatus();
-      });
-  bundle.execute = ffi::Ffi::Bind<ffi::ExecutionStage::kExecute>().To([&]() {
-    ++execute_calls;
-    return absl::OkStatus();
-  });
+  bundle.instantiate = ffi::Ffi::Bind<ffi::ExecutionStage::kInstantiate>()
+                           .Ctx<ffi::CustomOptions>()
+                           .To([&](ffi::Dictionary options) {
+                             EXPECT_TRUE(options.empty());
+                             ++instantiate_calls;
+                             return absl::OkStatus();
+                           });
+  bundle.prepare = ffi::Ffi::Bind<ffi::ExecutionStage::kPrepare>()
+                       .Ctx<ffi::CustomOptions>()
+                       .To([&](ffi::Dictionary options) {
+                         EXPECT_THAT(options.get<int64_t>("value"),
+                                     absl_testing::IsOkAndHolds(42));
+                         ++prepare_calls;
+                         return absl::OkStatus();
+                       });
+  bundle.initialize = ffi::Ffi::Bind<ffi::ExecutionStage::kInitialize>()
+                          .Ctx<ffi::CustomOptions>()
+                          .To([&](ffi::Dictionary options) {
+                            EXPECT_THAT(options.get<int64_t>("value"),
+                                        absl_testing::IsOkAndHolds(42));
+                            ++initialize_calls;
+                            return absl::OkStatus();
+                          });
+  bundle.execute = ffi::Ffi::Bind<ffi::ExecutionStage::kExecute>()
+                       .Ctx<ffi::CustomOptions>()
+                       .To([&](ffi::Dictionary options) {
+                         EXPECT_THAT(options.get<int64_t>("value"),
+                                     absl_testing::IsOkAndHolds(42));
+                         ++execute_calls;
+                         return absl::OkStatus();
+                       });
 
   ServiceExecutableRunOptions run_options;
   run_options.mutable_run_options()->set_stream(stream.get());
+  run_options.mutable_run_options()->set_custom_options(options);
   ASSERT_OK_AND_ASSIGN(
       CollectiveParams collective_params,
       CollectiveParams::Create(run_options, /*async_streams=*/{},
@@ -236,19 +269,16 @@ TEST(CustomCallThunkTest, CustomCallWithOwnedHandlers) {
   se::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations buffer_allocations({}, 0, &allocator);
 
-  CollectiveCliqueRequests clique_requests;
-  CollectiveMemoryRequests memory_requests(buffer_allocations);
-
-  Thunk::PrepareParams prepare_params{&collective_params, &clique_requests,
-                                      &memory_requests, executor,
-                                      &buffer_allocations};
-
-  Thunk::InitializeParams initialize_params;
-  initialize_params.stream = stream.get();
-  initialize_params.buffer_allocations = &buffer_allocations;
-  Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), buffer_allocations, stream.get(),
-      stream.get(), nullptr, nullptr, nullptr);
+  TestThunkParams thunk_params(executor, &buffer_allocations, stream.get());
+  thunk_params.WithRunOptions(&run_options)
+      .WithCommandBufferTraceStream(stream.get())
+      .WithCollectiveParams(&collective_params)
+      .WithCustomOptions(options.get())
+      .WithExecutionScopedState(nullptr);
+  Thunk::PrepareParams prepare_params = thunk_params.PrepareParams();
+  thunk_params.WithCollectiveParams(nullptr);
+  Thunk::InitializeParams initialize_params = thunk_params.InitializeParams();
+  Thunk::ExecuteParams execute_params = thunk_params.ExecuteParams();
 
   ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<CustomCallThunk> thunk,
@@ -302,17 +332,12 @@ TEST(CustomCallThunkTest, CustomCallWithOwnedHandlersWithoutOptionalOnes) {
   se::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations buffer_allocations({}, 0, &allocator);
 
-  CollectiveCliqueRequests clique_requests;
-  CollectiveMemoryRequests memory_requests(buffer_allocations);
-
-  Thunk::PrepareParams prepare_params{&collective_params, &clique_requests,
-                                      &memory_requests, executor,
-                                      &buffer_allocations};
-
-  Thunk::InitializeParams initialize_params = Thunk::InitializeParams{};
-  Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), buffer_allocations, stream.get(),
-      stream.get(), nullptr, nullptr, nullptr);
+  TestThunkParams thunk_params(executor, &buffer_allocations, stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get())
+      .WithCollectiveParams(&collective_params);
+  Thunk::PrepareParams prepare_params = thunk_params.PrepareParams();
+  Thunk::InitializeParams initialize_params = thunk_params.InitializeParams();
+  Thunk::ExecuteParams execute_params = thunk_params.ExecuteParams();
 
   // Optional handlers are null and shouldn't be invoked.
   ASSERT_OK_AND_ASSIGN(
@@ -333,10 +358,6 @@ TEST(CustomCallThunkTest, CustomCallWithOwnedHandlersWithoutExecute) {
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
                        executor->CreateStream());
   CustomCallThunk::OwnedHandlerBundle bundle;  // all handlers null
-  stream_executor::StreamExecutorAddressAllocator allocator(executor);
-  Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), BufferAllocations({}, 0, &allocator),
-      stream.get(), stream.get(), nullptr, nullptr, nullptr);
 
   EXPECT_THAT(CustomCallThunk::Create(
                   Thunk::ThunkInfo(), "target_name", std::move(bundle),
@@ -439,12 +460,9 @@ TEST(CustomCallThunkTest, ProtoConversion) {
        stream_executor::DeviceAddressBase(
            absl::bit_cast<void*>(static_cast<intptr_t>(0xABCDEF)), 1024)},
       0, &allocator);
-  Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), device_allocations,
-      /*stream=*/stream.get(),
-      /*command_buffer_trace_stream=*/stream.get(),
-      /*collective_params=*/nullptr,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &device_allocations, stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get());
+  Thunk::ExecuteParams params = thunk_params.ExecuteParams();
   EXPECT_THAT(new_thunk->ExecuteOnStream(params), IsOk());
 }
 
@@ -751,8 +769,8 @@ TEST(CustomCallThunkTest, RecordCommandBuffer) {
   se::DeviceAddress<uint8_t> dst =
       executor->AllocateArray<uint8_t>(kByteLength, 0);
   std::vector<uint8_t> host_src(kByteLength, 0x5A);
-  TF_ASSERT_OK(stream->Memcpy(&src, host_src.data(), kByteLength));
-  TF_ASSERT_OK(stream->MemZero(&dst, kByteLength));
+  ASSERT_OK(stream->Memcpy(&src, host_src.data(), kByteLength));
+  ASSERT_OK(stream->MemZero(&dst, kByteLength));
 
   BufferAllocation src_alloc{0, kByteLength, 0};
   BufferAllocation dst_alloc{1, kByteLength, 0};
@@ -763,36 +781,29 @@ TEST(CustomCallThunkTest, RecordCommandBuffer) {
   se::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations buffer_allocations({src, dst}, 0, &allocator);
 
-  Thunk::InitializeParams init_params;
-  init_params.executor = executor;
-  init_params.stream = stream.get();
-  init_params.buffer_allocations = &buffer_allocations;
-  TF_ASSERT_OK(thunk->Initialize(init_params));
+  TestThunkParams thunk_params(executor, &buffer_allocations, stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get());
+  ASSERT_OK(thunk->Initialize(thunk_params.InitializeParams()));
 
-  Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), buffer_allocations, stream.get(),
-      /*command_buffer_trace_stream=*/stream.get(),
-      /*collective_params=*/nullptr,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  Thunk::ExecuteParams execute_params = thunk_params.ExecuteParams();
 
   CommandStateManager state;
   Command::RecordParams record_params = {state};
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto command_buffer,
       executor->CreateCommandBuffer(se::CommandBuffer::Mode::kPrimary));
-  TF_ASSERT_OK_AND_ASSIGN(
-      const se::CommandBuffer::Command* cmd,
-      thunk->Record(execute_params, record_params,
-                    Command::RecordCreate{/*dependencies=*/{}},
-                    command_buffer.get()));
+  ASSERT_OK_AND_ASSIGN(const se::CommandBuffer::Command* cmd,
+                       thunk->Record(execute_params, record_params,
+                                     Command::RecordCreate{/*dependencies=*/{}},
+                                     command_buffer.get()));
   ASSERT_NE(cmd, nullptr);
-  TF_ASSERT_OK(command_buffer->Finalize());
-  TF_ASSERT_OK(command_buffer->Submit(stream.get()));
-  TF_ASSERT_OK(stream->BlockHostUntilDone());
+  ASSERT_OK(command_buffer->Finalize());
+  ASSERT_OK(command_buffer->Submit(stream.get()));
+  ASSERT_OK(stream->BlockHostUntilDone());
 
   std::vector<uint8_t> host_dst(kByteLength, 0);
-  TF_ASSERT_OK(stream->Memcpy(host_dst.data(), dst, kByteLength));
+  ASSERT_OK(stream->Memcpy(host_dst.data(), dst, kByteLength));
   EXPECT_EQ(host_dst, host_src);
 }
 
@@ -809,9 +820,9 @@ TEST(CustomCallThunkTest, RecordCommandBufferUpdate) {
   se::DeviceAddress<uint8_t> dst_second =
       executor->AllocateArray<uint8_t>(kByteLength, 0);
   std::vector<uint8_t> host_src(kByteLength, 0x3C);
-  TF_ASSERT_OK(stream->Memcpy(&src, host_src.data(), kByteLength));
-  TF_ASSERT_OK(stream->MemZero(&dst_first, kByteLength));
-  TF_ASSERT_OK(stream->MemZero(&dst_second, kByteLength));
+  ASSERT_OK(stream->Memcpy(&src, host_src.data(), kByteLength));
+  ASSERT_OK(stream->MemZero(&dst_first, kByteLength));
+  ASSERT_OK(stream->MemZero(&dst_second, kByteLength));
 
   BufferAllocation src_alloc{0, kByteLength, 0};
   BufferAllocation dst_alloc{1, kByteLength, 0};
@@ -822,59 +833,59 @@ TEST(CustomCallThunkTest, RecordCommandBufferUpdate) {
   se::StreamExecutorAddressAllocator allocator(executor);
 
   BufferAllocations allocs_first({src, dst_first}, 0, &allocator);
-  Thunk::InitializeParams init_params;
-  init_params.executor = executor;
-  init_params.stream = stream.get();
-  init_params.buffer_allocations = &allocs_first;
-  TF_ASSERT_OK(thunk->Initialize(init_params));
+  TestThunkParams thunk_params(executor, &allocs_first, stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get());
+  ASSERT_OK(thunk->Initialize(thunk_params.InitializeParams()));
 
-  Thunk::ExecuteParams params_first = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), allocs_first, stream.get(),
-      /*command_buffer_trace_stream=*/stream.get(),
-      /*collective_params=*/nullptr,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  Thunk::ExecuteParams params_first = thunk_params.ExecuteParams();
 
   CommandStateManager state;
   Command::RecordParams record_params = {state};
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto command_buffer,
       executor->CreateCommandBuffer(se::CommandBuffer::Mode::kPrimary));
-  TF_ASSERT_OK_AND_ASSIGN(
-      const se::CommandBuffer::Command* cmd,
-      thunk->Record(params_first, record_params,
-                    Command::RecordCreate{/*dependencies=*/{}},
-                    command_buffer.get()));
+  ASSERT_OK_AND_ASSIGN(const se::CommandBuffer::Command* cmd,
+                       thunk->Record(params_first, record_params,
+                                     Command::RecordCreate{/*dependencies=*/{}},
+                                     command_buffer.get()));
   ASSERT_NE(cmd, nullptr);
-  TF_ASSERT_OK(command_buffer->Finalize());
-  TF_ASSERT_OK(command_buffer->Submit(stream.get()));
-  TF_ASSERT_OK(stream->BlockHostUntilDone());
+  ASSERT_OK(command_buffer->Finalize());
+  ASSERT_OK(command_buffer->Submit(stream.get()));
+  ASSERT_OK(stream->BlockHostUntilDone());
 
   std::vector<uint8_t> host_first(kByteLength, 0);
-  TF_ASSERT_OK(stream->Memcpy(host_first.data(), dst_first, kByteLength));
+  ASSERT_OK(stream->Memcpy(host_first.data(), dst_first, kByteLength));
   EXPECT_EQ(host_first, host_src);
 
   // Update with a different destination allocation and re-submit.
   BufferAllocations allocs_second({src, dst_second}, 0, &allocator);
-  Thunk::ExecuteParams params_second = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), allocs_second, stream.get(),
-      /*command_buffer_trace_stream=*/stream.get(),
-      /*collective_params=*/nullptr,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  Thunk::ExecuteParams params_second =
+      thunk_params.WithBufferAllocations(&allocs_second).ExecuteParams();
 
-  TF_ASSERT_OK(command_buffer->Update());
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK(command_buffer->Update());
+  ASSERT_OK_AND_ASSIGN(
       const se::CommandBuffer::Command* updated_cmd,
       thunk->Record(params_second, record_params, Command::RecordUpdate{cmd},
                     command_buffer.get()));
   EXPECT_EQ(updated_cmd, cmd);
-  TF_ASSERT_OK(command_buffer->Finalize());
-  TF_ASSERT_OK(command_buffer->Submit(stream.get()));
-  TF_ASSERT_OK(stream->BlockHostUntilDone());
+  ASSERT_OK(command_buffer->Finalize());
+  ASSERT_OK(command_buffer->Submit(stream.get()));
+  ASSERT_OK(stream->BlockHostUntilDone());
 
   std::vector<uint8_t> host_second(kByteLength, 0);
-  TF_ASSERT_OK(stream->Memcpy(host_second.data(), dst_second, kByteLength));
+  ASSERT_OK(stream->Memcpy(host_second.data(), dst_second, kByteLength));
   EXPECT_EQ(host_second, host_src);
+}
+
+absl::StatusOr<void*> GetAddI32FunctionPtr() {
+  ABSL_ASSIGN_OR_RETURN(se::StreamExecutor * executor, GpuExecutor());
+  static const auto* kernel = [&]() {
+    auto k = executor->LoadKernel(se::gpu::GetAddI32PtxKernelSpec());
+    CHECK_OK(k.status());
+    return k->release();
+  }();
+  return kernel->platform_specific_handle().kernel;
 }
 
 absl::Status AddI32FfiHandler(ffi::RecordContext record_ctx,
@@ -883,11 +894,10 @@ absl::Status AddI32FfiHandler(ffi::RecordContext record_ctx,
   const std::array<void*, 3> args = {
       input_0.untyped_data(), input_1.untyped_data(), (*result).untyped_data()};
   const auto action = record_ctx.action();
-  se::KernelLoaderSpec add_i32 = se::gpu::GetAddI32PtxKernelSpec();
   if (action == ffi::RecordAction::kCreate) {
-    absl::string_view ptx = add_i32.cuda_ptx_in_memory().value().ptx;
+    ABSL_ASSIGN_OR_RETURN(void* func_ptr, GetAddI32FunctionPtr());
     auto cmd_or = record_ctx.CreateLaunch(
-        "AddI32", ptx.data(), ptx.size(), ffi::SourceFormat::kPtx,
+        "AddI32", func_ptr, /*kernel_size=*/0, ffi::SourceFormat::kFunctionPtr,
         /*launch_dims=*/{{1, 1, 1}, {1, 1, 1}},
         /*shared_mem_bytes=*/0, /*uses_pdl=*/false, args);
     if (!cmd_or.ok()) {
@@ -965,6 +975,8 @@ absl::StatusOr<Slices> AllocateAndCopy(se::Stream& stream,
 }
 
 struct FfiRecordTestSetup {
+  // Declared first so its owned FfiKernelRegistry outlives thunk and commands.
+  TestThunkParams thunk_params;
   std::unique_ptr<se::Stream> stream;
   std::unique_ptr<RecordTestAlloc> alloc;
   std::unique_ptr<CustomCallThunk> thunk;
@@ -993,15 +1005,14 @@ struct FfiRecordTestSetup {
                                     ->GetDeviceDescription()
                                     .gpu_compute_capability()));
 
-    Thunk::InitializeParams init_params;
-    init_params.executor = executor;
-    init_params.stream = setup->stream.get();
-    init_params.buffer_allocations = setup->alloc->buffer_allocations.get();
-    ABSL_RETURN_IF_ERROR(setup->thunk->Initialize(init_params));
+    setup->thunk_params.WithExecutor(executor)
+        .WithBufferAllocations(setup->alloc->buffer_allocations.get())
+        .WithStream(setup->stream.get())
+        .WithCommandBufferTraceStream(setup->stream.get());
+    ABSL_RETURN_IF_ERROR(
+        setup->thunk->Initialize(setup->thunk_params.InitializeParams()));
 
-    setup->execute_params = Thunk::ExecuteParams::Create(
-        ServiceExecutableRunOptions(), *setup->alloc->buffer_allocations,
-        setup->stream.get(), setup->stream.get(), nullptr, nullptr, nullptr);
+    setup->execute_params = setup->thunk_params.ExecuteParams();
 
     setup->state = std::make_unique<CommandStateManager>();
     setup->record_params.emplace(Command::RecordParams{*setup->state});
@@ -1054,9 +1065,9 @@ TEST(CustomCallThunkTest, RecordCommandBufferFfiRecord) {
   ASSERT_OK_AND_ASSIGN(auto slices1,
                        AllocateAndCopy(*setup->stream, alloc1, {40, 50}, {0}));
 
-  Thunk::ExecuteParams execute_params2 = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), *alloc1.buffer_allocations,
-      setup->stream.get(), setup->stream.get(), nullptr, nullptr, nullptr);
+  Thunk::ExecuteParams execute_params2 =
+      Thunk::ExecuteParams::CloneWithNewAllocations(*setup->execute_params,
+                                                    *alloc1.buffer_allocations);
 
   ASSERT_OK(setup->thunk->Record(execute_params2, *setup->record_params,
                                  Command::RecordUpdate{cmd}, cb.get()));
@@ -1074,16 +1085,15 @@ absl::Status AddI32WithBarrierFfiHandler(ffi::RecordExtension::Type record_ctx,
                                          ffi::AnyBuffer input_0,
                                          ffi::AnyBuffer input_1,
                                          ffi::Result<ffi::AnyBuffer> result) {
-  se::KernelLoaderSpec add_i32 = se::gpu::GetAddI32PtxKernelSpec();
   if (record_ctx.action() == ffi::RecordAction::kCreate) {
-    absl::string_view ptx = add_i32.cuda_ptx_in_memory().value().ptx;
+    ABSL_ASSIGN_OR_RETURN(void* func_ptr, GetAddI32FunctionPtr());
     const std::vector<void*> args = {input_0.untyped_data(),
                                      input_1.untyped_data(),
                                      (*result).untyped_data()};
 
     // Launch A
     auto cmd_a_or = record_ctx.CreateLaunch(
-        "AddI32", ptx.data(), ptx.size(), ffi::SourceFormat::kPtx,
+        "AddI32", func_ptr, /*kernel_size=*/0, ffi::SourceFormat::kFunctionPtr,
         /*launch_dims=*/{{1, 1, 1}, {1, 1, 1}},
         /*shared_mem_bytes=*/0, /*uses_pdl=*/false, args);
     if (!cmd_a_or.ok()) {
@@ -1092,7 +1102,7 @@ absl::Status AddI32WithBarrierFfiHandler(ffi::RecordExtension::Type record_ctx,
 
     // Launch B
     auto cmd_b_or = record_ctx.CreateLaunch(
-        "AddI32", ptx.data(), ptx.size(), ffi::SourceFormat::kPtx,
+        "AddI32", func_ptr, /*kernel_size=*/0, ffi::SourceFormat::kFunctionPtr,
         /*launch_dims=*/{{1, 1, 1}, {1, 1, 1}},
         /*shared_mem_bytes=*/0, /*uses_pdl=*/false, args);
     if (!cmd_b_or.ok()) {
@@ -1159,9 +1169,9 @@ TEST(CustomCallThunkTest, RecordCommandBufferFfiRecordWithEmptyCommand) {
   ASSERT_OK_AND_ASSIGN(auto slices1,
                        AllocateAndCopy(*setup->stream, alloc1, {40, 50}, {0}));
 
-  Thunk::ExecuteParams execute_params_update = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), *alloc1.buffer_allocations,
-      setup->stream.get(), setup->stream.get(), nullptr, nullptr, nullptr);
+  Thunk::ExecuteParams execute_params_update =
+      Thunk::ExecuteParams::CloneWithNewAllocations(*setup->execute_params,
+                                                    *alloc1.buffer_allocations);
 
   ASSERT_OK(setup->thunk->Record(execute_params_update, *setup->record_params,
                                  Command::RecordUpdate{cmd}, cb.get()));
@@ -1200,9 +1210,8 @@ TEST(CustomCallThunkTest, RecordCommandBufferMultipleRecordsInSameBuffer) {
       auto slices_iter1_create,
       AllocateAndCopy(*setup->stream, alloc_iter1_create, {1, 2}, {0}));
   Thunk::ExecuteParams execute_params_iter1_create =
-      Thunk::ExecuteParams::Create(
-          ServiceExecutableRunOptions(), *alloc_iter1_create.buffer_allocations,
-          setup->stream.get(), setup->stream.get(), nullptr, nullptr, nullptr);
+      Thunk::ExecuteParams::CloneWithNewAllocations(
+          *setup->execute_params, *alloc_iter1_create.buffer_allocations);
 
   ASSERT_OK_AND_ASSIGN(auto cb, executor->CreateCommandBuffer(
                                     se::CommandBuffer::Mode::kPrimary));
@@ -1232,18 +1241,16 @@ TEST(CustomCallThunkTest, RecordCommandBufferMultipleRecordsInSameBuffer) {
       auto slices_iter0_update,
       AllocateAndCopy(*setup->stream, alloc_iter0_update, {40, 50}, {0}));
   Thunk::ExecuteParams execute_params_iter0_update =
-      Thunk::ExecuteParams::Create(
-          ServiceExecutableRunOptions(), *alloc_iter0_update.buffer_allocations,
-          setup->stream.get(), setup->stream.get(), nullptr, nullptr, nullptr);
+      Thunk::ExecuteParams::CloneWithNewAllocations(
+          *setup->execute_params, *alloc_iter0_update.buffer_allocations);
 
   RecordTestAlloc alloc_iter1_update(executor);
   ASSERT_OK_AND_ASSIGN(
       auto slices_iter1_update,
       AllocateAndCopy(*setup->stream, alloc_iter1_update, {100, 200}, {0}));
   Thunk::ExecuteParams execute_params_iter1_update =
-      Thunk::ExecuteParams::Create(
-          ServiceExecutableRunOptions(), *alloc_iter1_update.buffer_allocations,
-          setup->stream.get(), setup->stream.get(), nullptr, nullptr, nullptr);
+      Thunk::ExecuteParams::CloneWithNewAllocations(
+          *setup->execute_params, *alloc_iter1_update.buffer_allocations);
 
   ASSERT_OK(setup->thunk->Record(execute_params_iter0_update,
                                  *setup->record_params,
@@ -1263,6 +1270,187 @@ TEST(CustomCallThunkTest, RecordCommandBufferMultipleRecordsInSameBuffer) {
                                   sizeof(int32_t)));
   EXPECT_EQ(out_0, 90);
   EXPECT_EQ(out_1, 300);
+}
+
+TEST(CustomCallThunkTest, PrepareSetsCommandBufferRequiresWarmup) {
+  static_assert(
+      ffi::internal::IsStageCompatibleCtx<
+          ffi::CommandBufferRequests, ffi::ExecutionStage::kPrepare>::value);
+  static_assert(
+      !ffi::internal::IsStageCompatibleCtx<
+          ffi::CommandBufferRequests, ffi::ExecutionStage::kInitialize>::value);
+  static_assert(
+      !ffi::internal::IsStageCompatibleCtx<
+          ffi::CommandBufferRequests, ffi::ExecutionStage::kExecute>::value);
+  static_assert(
+      !ffi::internal::IsStageCompatibleCtx<
+          ffi::CommandBufferRequests, ffi::ExecutionStage::kRecord>::value);
+
+  ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor, GpuExecutor());
+
+  std::optional<bool> request_warmup = std::nullopt;
+  CustomCallThunk::OwnedHandlerBundle bundle;
+  bundle.prepare = ffi::Ffi::BindPrepare().Ctx<ffi::CommandBufferRequests>().To(
+      [&request_warmup](CommandBufferRequests* reqs) -> absl::Status {
+        if (reqs != nullptr && request_warmup.has_value()) {
+          reqs->SetRequiresWarmup(*request_warmup);
+        }
+        return absl::OkStatus();
+      });
+  bundle.execute =
+      ffi::Ffi::BindExecute().To([]() { return absl::OkStatus(); });
+  bundle.record = ffi::Ffi::BindRecord().To([]() { return absl::OkStatus(); });
+
+  ASSERT_OK_AND_ASSIGN(
+      auto thunk,
+      CustomCallThunk::Create(
+          Thunk::ThunkInfo(), "prepare_sets_requires_warmup", std::move(bundle),
+          /*operands=*/{},
+          /*results=*/{}, /*attributes=*/{},
+          /*called_computation=*/nullptr,
+          executor->GetDeviceDescription().gpu_compute_capability()));
+  // Before Prepare runs, requires_warmup() defaults to true.
+  EXPECT_TRUE(thunk->requires_warmup());
+
+  BufferAllocations buffer_allocations({}, 0, nullptr);
+
+  // 0. Prepare does not call SetRequiresWarmup -> requires_warmup(thunk)
+  // remains std::nullopt so callers fall back to thunk->requires_warmup().
+  {
+    request_warmup = std::nullopt;
+    TestThunkParams thunk_params(executor, &buffer_allocations);
+    EXPECT_THAT(thunk->Prepare(thunk_params.PrepareParams()),
+                absl_testing::IsOk());
+    EXPECT_EQ(
+        thunk_params.command_buffer_requests().requires_warmup(thunk.get()),
+        std::nullopt);
+  }
+
+  // 1. Prepare sets SetRequiresWarmup(false) -> command_buffer_requests records
+  // requires_warmup == false for this thunk.
+  {
+    request_warmup = false;
+    TestThunkParams thunk_params(executor, &buffer_allocations);
+    EXPECT_THAT(thunk->Prepare(thunk_params.PrepareParams()),
+                absl_testing::IsOk());
+    EXPECT_EQ(
+        thunk_params.command_buffer_requests().requires_warmup(thunk.get()),
+        false);
+  }
+
+  // 2. Next execution: Prepare sets SetRequiresWarmup(true) ->
+  // command_buffer_requests records requires_warmup == true for this thunk.
+  {
+    request_warmup = true;
+    TestThunkParams thunk_params(executor, &buffer_allocations);
+    EXPECT_THAT(thunk->Prepare(thunk_params.PrepareParams()),
+                absl_testing::IsOk());
+    EXPECT_EQ(
+        thunk_params.command_buffer_requests().requires_warmup(thunk.get()),
+        true);
+  }
+}
+
+TEST(CustomCallThunkTest, KernelRegistryInitializeAndExecute) {
+  ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor, GpuExecutor());
+
+  const XLA_FFI_Kernel* registered_kernel = nullptr;
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<uint8_t> fatbin,
+      se::gpu::GetGpuTestKernelsFatbin(executor->GetPlatform()->Name()));
+
+  CustomCallThunk::OwnedHandlerBundle bundle;
+  bundle.initialize = ffi::Ffi::BindInitialize().Ctx<ffi::KernelRegistry>().To(
+      [&](ffi::InitializeKernelRegistry registry) -> absl::Status {
+        ABSL_ASSIGN_OR_RETURN(
+            registered_kernel,
+            registry.Register("AddI32",
+                              reinterpret_cast<const char*>(fatbin.data()),
+                              fatbin.size(), ffi::SourceFormat::kCubin,
+                              /*uses_pdl=*/false));
+        return absl::OkStatus();
+      });
+  bundle.execute =
+      ffi::Ffi::BindExecute()
+          .Ctx<ffi::KernelRegistry>()
+          .Arg<ffi::AnyBuffer>()
+          .Arg<ffi::AnyBuffer>()
+          .Ret<ffi::AnyBuffer>()
+          .To([&](ffi::ExecuteKernelRegistry registry, ffi::AnyBuffer input_0,
+                  ffi::AnyBuffer input_1, ffi::Result<ffi::AnyBuffer> result) {
+            const std::vector<void*> args = {input_0.untyped_data(),
+                                             input_1.untyped_data(),
+                                             (*result).untyped_data()};
+            return registry.Launch(registered_kernel,
+                                   /*launch_dims=*/{{1, 1, 1}, {1, 1, 1}},
+                                   /*shared_mem_bytes=*/0, /*uses_pdl=*/false,
+                                   args);
+          });
+
+  ASSERT_OK_AND_ASSIGN(
+      auto setup,
+      FfiRecordTestSetup::Create(executor, std::move(bundle),
+                                 "add_i32_kernel_registry", {10, 20}, {0}));
+  ASSERT_NE(registered_kernel, nullptr);
+
+  ASSERT_OK(setup->thunk->ExecuteOnStream(*setup->execute_params));
+  ASSERT_OK(setup->stream->BlockHostUntilDone());
+  int32_t host_exec = 0;
+  ASSERT_OK(setup->stream->Memcpy(&host_exec, setup->alloc->result_dev_ptrs[0],
+                                  sizeof(int32_t)));
+  EXPECT_EQ(host_exec, 30);
+}
+
+TEST(CustomCallThunkTest, KernelRegistryPrepareAndExecute) {
+  ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor, GpuExecutor());
+
+  const XLA_FFI_Kernel* registered_kernel = nullptr;
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<uint8_t> fatbin,
+      se::gpu::GetGpuTestKernelsFatbin(executor->GetPlatform()->Name()));
+
+  CustomCallThunk::OwnedHandlerBundle bundle;
+  bundle.prepare = ffi::Ffi::BindPrepare().Ctx<ffi::KernelRegistry>().To(
+      [&](ffi::PrepareKernelRegistry registry) -> absl::Status {
+        ABSL_ASSIGN_OR_RETURN(
+            registered_kernel,
+            registry.Register("AddI32",
+                              reinterpret_cast<const char*>(fatbin.data()),
+                              fatbin.size(), ffi::SourceFormat::kCubin,
+                              /*uses_pdl=*/false));
+        return absl::OkStatus();
+      });
+  bundle.execute =
+      ffi::Ffi::BindExecute()
+          .Ctx<ffi::KernelRegistry>()
+          .Arg<ffi::AnyBuffer>()
+          .Arg<ffi::AnyBuffer>()
+          .Ret<ffi::AnyBuffer>()
+          .To([&](ffi::ExecuteKernelRegistry registry, ffi::AnyBuffer input_0,
+                  ffi::AnyBuffer input_1, ffi::Result<ffi::AnyBuffer> result) {
+            const std::vector<void*> args = {input_0.untyped_data(),
+                                             input_1.untyped_data(),
+                                             (*result).untyped_data()};
+            return registry.Launch(registered_kernel,
+                                   /*launch_dims=*/{{1, 1, 1}, {1, 1, 1}},
+                                   /*shared_mem_bytes=*/0, /*uses_pdl=*/false,
+                                   args);
+          });
+
+  ASSERT_OK_AND_ASSIGN(
+      auto setup,
+      FfiRecordTestSetup::Create(executor, std::move(bundle),
+                                 "add_i32_prepare_registry", {7, 8}, {0}));
+
+  ASSERT_OK(setup->thunk->Prepare(setup->thunk_params.PrepareParams()));
+  ASSERT_NE(registered_kernel, nullptr);
+
+  ASSERT_OK(setup->thunk->ExecuteOnStream(*setup->execute_params));
+  ASSERT_OK(setup->stream->BlockHostUntilDone());
+  int32_t host_exec = 0;
+  ASSERT_OK(setup->stream->Memcpy(&host_exec, setup->alloc->result_dev_ptrs[0],
+                                  sizeof(int32_t)));
+  EXPECT_EQ(host_exec, 15);
 }
 
 }  // namespace

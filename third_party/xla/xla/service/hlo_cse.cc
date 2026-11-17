@@ -37,7 +37,6 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/service/hlo_cse_constant_key.h"
-#include "xla/service/hlo_domain_map.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/side_effect_util.h"
@@ -56,17 +55,6 @@ template <bool kIsLayoutSensitive>
 absl::StatusOr<bool> CombineConstants(
     HloComputation* computation,
     absl::AnyInvocable<bool(const HloInstruction*)> should_combine_constant) {
-  // Populating the domain map is somewhat expensive -- only do it if there are
-  // kDomain ops in the computation.  If there are no kDomain ops, the domain
-  // map is trivial, every op gets mapped to the same domain.
-  std::unique_ptr<HloDomainMap> domain_map;
-  if (absl::c_any_of(computation->instructions(),
-                     [&](const HloInstruction* instr) {
-                       return instr->opcode() == HloOpcode::kDomain;
-                     })) {
-    ABSL_ASSIGN_OR_RETURN(domain_map, HloDomainMap::Create(computation, ""));
-  }
-
   // Map from the literal hash of a constant or the shape hash of an iota all
   // equivalent instructions. This avoids extreme quadratic behavior with many
   // scalar constants.
@@ -90,10 +78,8 @@ absl::StatusOr<bool> CombineConstants(
     HloInstruction* match = nullptr;
     if (auto* constant_inst = DynCast<HloConstantInstruction>(instruction)) {
       auto [it, did_insert] = constants.insert(
-          {CseConstantKey<kIsLayoutSensitive>{
-               constant_inst->literal(), constant_inst->shape(),
-               (domain_map != nullptr ? domain_map->GetDomainId(instruction)
-                                      : 0)},
+          {CseConstantKey<kIsLayoutSensitive>{constant_inst->literal(),
+                                              constant_inst->shape()},
            constant_inst});
       if (!did_insert) {
         match = it->second;
@@ -110,6 +96,30 @@ absl::StatusOr<bool> CombineConstants(
   VLOG(4) << "Combined " << combined << " constants and iotas in "
           << computation->name() << " computation";
   return combined > 0;
+}
+
+constexpr absl::string_view kAllocateBufferTarget = "AllocateBuffer";
+
+// Returns true if operand `operand_index` of `instruction` may be a fresh
+// output buffer.
+bool MayBeFreshRaggedAllToAllOutputBuffer(const HloInstruction* instruction,
+                                          int64_t operand_index) {
+  const HloInstruction* operand = instruction->operand(operand_index);
+  return instruction->opcode() == HloOpcode::kRaggedAllToAll &&
+         operand_index == 1 && operand->operand_count() == 0 &&
+         operand->IsCustomCall(kAllocateBufferTarget);
+}
+
+// Returns true if `instruction` is an AllocateBuffer that is only used as the
+// output buffer of a single ragged-all-to-all.
+bool IsFreshRaggedAllToAllOutputBuffer(const HloInstruction* instruction) {
+  if (instruction->user_count() != 1 || instruction->HasControlDependencies()) {
+    return false;
+  }
+  const HloInstruction* user = instruction->users().front();
+  return user->OperandIndices(instruction).size() == 1 &&
+         user->operand_index(instruction) == 1 &&
+         MayBeFreshRaggedAllToAllOutputBuffer(user, 1);
 }
 
 // This differs from "normal" HLO Instruction hashing because it takes the
@@ -162,11 +172,14 @@ struct CseKey {
         }
         h = H::combine(std::move(h), id0, id1);
       } else {
-        for (auto operand : instruction->operands()) {
-          if (operand->opcode() == HloOpcode::kIota) {
+        for (int64_t i = 0; i < instruction->operand_count(); ++i) {
+          // Equivalent iotas and fresh output buffers may be distinct
+          // instructions (see `eq_instructions` in RunOnComputation).
+          if (instruction->operand(i)->opcode() == HloOpcode::kIota ||
+              MayBeFreshRaggedAllToAllOutputBuffer(instruction, i)) {
             continue;
           }
-          h = H::combine(std::move(h), operand->unique_id());
+          h = H::combine(std::move(h), instruction->operand(i)->unique_id());
         }
       }
     }
@@ -248,10 +261,10 @@ struct CseKey {
         return H::combine(std::move(h), instruction->dimensions());
       case HloOpcode::kGetTupleElement:
         return H::combine(std::move(h), instruction->tuple_index());
-      case HloOpcode::kCompare:
-        return H::combine(
-            std::move(h),
-            Cast<HloCompareInstruction>(instruction)->direction());
+      case HloOpcode::kCompare: {
+        const auto* cmp = Cast<HloCompareInstruction>(instruction);
+        return H::combine(std::move(h), cmp->direction(), cmp->order());
+      }
       default:
         return std::move(h);
     }
@@ -313,13 +326,19 @@ absl::StatusOr<bool> HloCSE::RunOnComputation(HloComputation* computation) {
     if (a == b) {
       return true;
     }
+    const auto eq_shapes = [&] {
+      return is_layout_sensitive_
+                 ? ShapeUtil::Equal(a->shape(), b->shape())
+                 : ShapeUtil::Compatible(a->shape(), b->shape());
+    };
+    if (IsFreshRaggedAllToAllOutputBuffer(a) &&
+        IsFreshRaggedAllToAllOutputBuffer(b)) {
+      return eq_shapes();
+    }
     if (a->opcode() != b->opcode() || a->opcode() != HloOpcode::kIota) {
       return false;
     }
-    return a->dimensions(0) == b->dimensions(0) &&
-           (is_layout_sensitive_
-                ? ShapeUtil::Equal(a->shape(), b->shape())
-                : ShapeUtil::Compatible(a->shape(), b->shape()));
+    return a->dimensions(0) == b->dimensions(0) && eq_shapes();
   };
   const auto eq_computations = [](const HloComputation* lhs,
                                   const HloComputation* rhs) {
@@ -338,6 +357,15 @@ absl::StatusOr<bool> HloCSE::RunOnComputation(HloComputation* computation) {
   absl::flat_hash_set<CseKey, absl::Hash<CseKey>, decltype(cse_equal)>
       representatives(/*N=*/computation->instruction_count() + 1,
                       absl::Hash<CseKey>{}, cse_equal);
+  // Removed instructions must not stay in `representatives`, otherwise an
+  // equivalent instruction visited later would be replaced with an instruction
+  // that is no longer part of the computation.
+  const auto erase_representative = [&](HloInstruction* removed) {
+    auto it = representatives.find(CseKey{removed});
+    if (it != representatives.end() && it->hlo == removed) {
+      representatives.erase(it);
+    }
+  };
   for (auto instruction : computation->MakeInstructionPostOrder()) {
     if (should_eliminate_instruction_ != nullptr
             ? !should_eliminate_instruction_(instruction)
@@ -357,7 +385,15 @@ absl::StatusOr<bool> HloCSE::RunOnComputation(HloComputation* computation) {
       HloInstruction* equivalent_instruction = pair.first->hlo;
       ABSL_RETURN_IF_ERROR(instruction->ReplaceAllUsesWith(equivalent_instruction));
       ABSL_RETURN_IF_ERROR(computation->RemoveInstructionAndUnusedOperands(
-          instruction, /*cleanup=*/std::nullopt, ignore_control_dependencies_));
+          instruction,
+          /*cleanup=*/
+          [&](HloInstruction* removed) {
+            // `instruction` itself was not inserted into `representatives`.
+            if (removed != instruction) {
+              erase_representative(removed);
+            }
+          },
+          ignore_control_dependencies_));
       VLOG(4) << "Replaced " << instruction->name() << " with "
               << equivalent_instruction->name();
       changed = true;
@@ -376,6 +412,7 @@ absl::StatusOr<bool> HloCSE::RunOnComputation(HloComputation* computation) {
         ABSL_RETURN_IF_ERROR(instruction->ReplaceOperandWith(j, a));
         changed = true;
         if (b->IsDead()) {
+          erase_representative(b);
           ABSL_RETURN_IF_ERROR(computation->RemoveInstruction(b));
         }
       }

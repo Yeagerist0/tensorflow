@@ -26,13 +26,12 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include "absl/algorithm/container.h"
 #include "absl/base/casts.h"
-#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
+#include "absl/strings/string_view.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/backends/gpu/runtime/async_thunk.h"
 #include "xla/backends/gpu/runtime/collective_thunk.h"
@@ -46,6 +45,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk.pb.h"
 #include "xla/backends/gpu/runtime/thunk_executor.h"
+#include "xla/backends/gpu/runtime/thunk_test_utils.h"
 #include "xla/core/collectives/rank_id.h"
 #include "xla/hlo/ir/collective_op_group_mode.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -62,7 +62,6 @@ limitations under the License.
 #include "xla/service/gpu/gpu_executable.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/service/platform_util.h"
-#include "xla/service/service_executable_run_options.h"
 #include "xla/service/shaped_slice.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
@@ -227,7 +226,8 @@ ENTRY test_computation {
   ThunkSequence start_sequence;
   start_sequence.push_back(std::move(cp_start_thunk));
   auto async_start = std::make_unique<AsyncStartThunk>(
-      Thunk::ThunkInfo(), CommunicationStreamId(0), std::move(start_sequence));
+      Thunk::ThunkInfo(), CommunicationStreamId(0), std::move(start_sequence),
+      /*devices_per_host=*/1);
   auto async_done = std::make_unique<AsyncDoneThunk>(
       Thunk::ThunkInfo(), async_start->async_execution());
 
@@ -414,13 +414,9 @@ TEST(CollectivePermuteThunkTest, RecordCommandBufferCreate) {
   se::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations allocations({src, dst}, 0, &allocator);
 
-  ServiceExecutableRunOptions run_options;
-  Thunk::ExecuteParams execute_params =
-      Thunk::ExecuteParams::Create(run_options, allocations, stream.get(),
-                                   /*command_buffer_trace_stream=*/stream.get(),
-                                   /*collective_params=*/nullptr,
-                                   /*collective_cliques=*/nullptr,
-                                   /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &allocations, stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get());
+  Thunk::ExecuteParams execute_params = thunk_params.ExecuteParams();
 
   CommandStateManager state;
   Command::RecordParams record_params = {state};
@@ -466,15 +462,10 @@ TEST(CollectivePermuteThunkTest, RecordCommandBufferUpdate) {
       MakeNoOpThunk(alloc_src, alloc_dst, length);
 
   se::StreamExecutorAddressAllocator allocator(executor);
-  ServiceExecutableRunOptions run_options;
-
   BufferAllocations allocations1({src1, dst1}, 0, &allocator);
-  Thunk::ExecuteParams params1 =
-      Thunk::ExecuteParams::Create(run_options, allocations1, stream.get(),
-                                   /*command_buffer_trace_stream=*/stream.get(),
-                                   /*collective_params=*/nullptr,
-                                   /*collective_cliques=*/nullptr,
-                                   /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &allocations1, stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get());
+  Thunk::ExecuteParams params1 = thunk_params.ExecuteParams();
 
   CommandStateManager state;
   Command::RecordParams record_params = {state};
@@ -494,11 +485,7 @@ TEST(CollectivePermuteThunkTest, RecordCommandBufferUpdate) {
 
   BufferAllocations allocations2({src2, dst2}, 0, &allocator);
   Thunk::ExecuteParams params2 =
-      Thunk::ExecuteParams::Create(run_options, allocations2, stream.get(),
-                                   /*command_buffer_trace_stream=*/stream.get(),
-                                   /*collective_params=*/nullptr,
-                                   /*collective_cliques=*/nullptr,
-                                   /*collective_memory=*/nullptr);
+      thunk_params.WithBufferAllocations(&allocations2).ExecuteParams();
 
   std::vector<BufferAllocation::Index> updated_allocs = {0, 1};
   Command::RecordParams record_params2 = {state, std::move(updated_allocs)};
@@ -515,25 +502,11 @@ TEST(CollectivePermuteThunkTest, RecordCommandBufferUpdate) {
   ASSERT_OK(stream->BlockHostUntilDone());
 }
 
-// Helper to extract just the sorted component member lists (ignoring root keys)
-// for easier comparison.
-std::vector<std::vector<int64_t>> ComponentValues(
-    const absl::flat_hash_map<int64_t, std::vector<int64_t>>& components) {
-  std::vector<std::vector<int64_t>> result;
-  result.reserve(components.size());
-  for (const auto& [root, members] : components) {
-    result.push_back(members);
-  }
-  absl::c_sort(result);
-  return result;
-}
-
 TEST(SourceTargetConnectedComponentsTest, SingleComponent) {
   // Ring pattern: 0->1->2->3->0, all connected.
   std::vector<std::pair<int64_t, int64_t>> pairs = {
       {0, 1}, {1, 2}, {2, 3}, {3, 0}};
-  auto components = SourceTargetConnectedComponents(4, pairs);
-  EXPECT_THAT(ComponentValues(components),
+  EXPECT_THAT(SourceTargetConnectedComponents(4, pairs),
               ElementsAre(ElementsAre(0, 1, 2, 3)));
 }
 
@@ -541,24 +514,21 @@ TEST(SourceTargetConnectedComponentsTest, TwoDisjointRings) {
   // Two 4-device rings on a 2-node setup: {0..3} and {4..7}.
   std::vector<std::pair<int64_t, int64_t>> pairs = {
       {0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6}, {6, 7}, {7, 4}};
-  auto components = SourceTargetConnectedComponents(8, pairs);
-  EXPECT_THAT(ComponentValues(components),
+  EXPECT_THAT(SourceTargetConnectedComponents(8, pairs),
               ElementsAre(ElementsAre(0, 1, 2, 3), ElementsAre(4, 5, 6, 7)));
 }
 
 TEST(SourceTargetConnectedComponentsTest, IsolatedDevices) {
   // Only devices 0 and 1 communicate; device 2 is isolated.
   std::vector<std::pair<int64_t, int64_t>> pairs = {{0, 1}};
-  auto components = SourceTargetConnectedComponents(3, pairs);
-  EXPECT_THAT(ComponentValues(components),
+  EXPECT_THAT(SourceTargetConnectedComponents(3, pairs),
               ElementsAre(ElementsAre(0, 1), ElementsAre(2)));
 }
 
 TEST(SourceTargetConnectedComponentsTest, AllIsolated) {
   // No pairs at all — every device is its own singleton.
   std::vector<std::pair<int64_t, int64_t>> pairs = {};
-  auto components = SourceTargetConnectedComponents(4, pairs);
-  EXPECT_THAT(ComponentValues(components),
+  EXPECT_THAT(SourceTargetConnectedComponents(4, pairs),
               ElementsAre(ElementsAre(0), ElementsAre(1), ElementsAre(2),
                           ElementsAre(3)));
 }
@@ -566,26 +536,52 @@ TEST(SourceTargetConnectedComponentsTest, AllIsolated) {
 TEST(SourceTargetConnectedComponentsTest, ChainNotRing) {
   // Chain: 0->1->2->3 (no wrap). All connected via transitivity.
   std::vector<std::pair<int64_t, int64_t>> pairs = {{0, 1}, {1, 2}, {2, 3}};
-  auto components = SourceTargetConnectedComponents(4, pairs);
-  EXPECT_THAT(ComponentValues(components),
+  EXPECT_THAT(SourceTargetConnectedComponents(4, pairs),
               ElementsAre(ElementsAre(0, 1, 2, 3)));
 }
 
 TEST(SourceTargetConnectedComponentsTest, SinglePairManyDevices) {
   // 16 devices, only 0->1 communicates.
   std::vector<std::pair<int64_t, int64_t>> pairs = {{0, 1}};
-  auto components = SourceTargetConnectedComponents(16, pairs);
-  // Should have {0,1} and 14 singletons.
-  EXPECT_EQ(components.size(), 15);
-  // Check the communicating pair is together.
-  bool found_pair = false;
-  for (const auto& [root, members] : components) {
-    if (members.size() == 2) {
-      EXPECT_THAT(members, ElementsAre(0, 1));
-      found_pair = true;
-    }
-  }
-  EXPECT_TRUE(found_pair);
+  // Should have {0,1} followed by 14 singletons in ascending order.
+  EXPECT_THAT(SourceTargetConnectedComponents(16, pairs),
+              ElementsAre(ElementsAre(0, 1), ElementsAre(2), ElementsAre(3),
+                          ElementsAre(4), ElementsAre(5), ElementsAre(6),
+                          ElementsAre(7), ElementsAre(8), ElementsAre(9),
+                          ElementsAre(10), ElementsAre(11), ElementsAre(12),
+                          ElementsAre(13), ElementsAre(14), ElementsAre(15)));
+}
+
+TEST_F(GpuCollectivePermuteTest, GetP2PConfigConnectedComponentsDeterministic) {
+  constexpr absl::string_view kHloText = R"(
+HloModule test, replica_count=8
+ENTRY test_computation {
+  p = u32[4] parameter(0)
+  ROOT permute = u32[4] collective-permute(p),
+    source_target_pairs={{4,6}, {6,4}, {1,3}, {3,1}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(kHloText));
+  const auto* cp_instr =
+      absl::down_cast<const HloCollectivePermuteInstruction*>(
+          module->entry_computation()->root_instruction());
+
+  P2PConfig p2p_config = CollectivePermuteThunk::GetP2PConfig(
+      cp_instr, /*replica_count=*/8, /*partition_count=*/1,
+      /*connected_components_enabled=*/true);
+
+  EXPECT_THAT(p2p_config.config.ToProto(), EqualsProto(R"pb(
+                operand_element_type: U32
+                replica_groups { replica_ids: 0 }
+                replica_groups { replica_ids: 1 replica_ids: 3 }
+                replica_groups { replica_ids: 2 }
+                replica_groups { replica_ids: 4 replica_ids: 6 }
+                replica_groups { replica_ids: 5 }
+                replica_groups { replica_ids: 7 }
+                group_mode: COLLECTIVE_OP_GROUP_MODE_CROSS_REPLICA
+                use_symmetric_buffer: false
+              )pb"));
 }
 
 TEST(RemapSourceTargetToCliqueRanksTest, CrossPartitionRemapsToCliqueRanks) {

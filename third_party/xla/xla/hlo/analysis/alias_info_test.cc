@@ -1201,5 +1201,82 @@ ENTRY main {
   EXPECT_FALSE(alias_info.MustAlias(p1, {}, dus, {}));
 }
 
+// Verifies that without output_to_operand_aliasing, an AsyncStart wrapping a
+// DUS returns empty in-place pairs (treated as out-of-place). This will result
+// in a new buffer for the result of the async dus and trigger copy insertion.
+// On the other hand, adding the attribute correctly confirms the in-place
+// aliasing with Operand 0.
+TEST_F(GetInPlaceInputOutputPairsTest, AsyncDUSAliasingBlindness) {
+  const char* kHlo = R"(
+HloModule test
+
+async_computation {
+  p0 = f32[10] parameter(0)
+  p1 = f32[5] parameter(1)
+  p2 = s32[] parameter(2)
+  ROOT dus = f32[10] dynamic-update-slice(p0, p1, p2)
+}
+
+ENTRY test {
+  p0 = f32[10] parameter(0)
+  p1 = f32[5] parameter(1)
+  p2 = s32[] parameter(2)
+  start_unannotated = ((f32[10], f32[5], s32[]), f32[10], s32[]) async-start(p0, p1, p2),
+      calls=async_computation
+  done_unannotated = f32[10] async-done(start_unannotated)
+  start_annotated = ((f32[10], f32[5], s32[]), f32[10], s32[]) async-start(p0, p1, p2),
+      calls=async_computation, output_to_operand_aliasing={{1}: (0, {})}
+  done_annotated = f32[10] async-done(start_annotated)
+  ROOT tuple = (f32[10], f32[10]) tuple(done_unannotated, done_annotated)
+}
+  )";
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* unannotated =
+      FindInstruction(module.get(), "start_unannotated");
+  HloInstruction* annotated = FindInstruction(module.get(), "start_annotated");
+
+  // 1. Without attribute, XLA is blind to inner DUS in-place semantics:
+  EXPECT_TRUE(alias_info_.GetInPlaceInputOutputPairs(unannotated).empty());
+
+  // 2. With attribute, XLA recognizes Output {1} aliases Operand 0 in-place:
+  std::vector<std::pair<HloOperandIndex, ShapeIndex>> expected_pairs = {
+      {HloOperandIndex{0, {}}, {1}}};
+  EXPECT_EQ(alias_info_.GetInPlaceInputOutputPairs(annotated), expected_pairs);
+}
+
+TEST_F(GetInPlaceInputOutputPairsTest, IsMatchingInPlaceDusReadSlice) {
+  const char* const kHlo = R"hlo(
+HloModule test
+
+ENTRY main {
+  p = f32[8,4]{1,0} parameter(0)
+  p_dyn = f32[<=8,4]{1,0} parameter(1)
+  c0 = s32[] constant(0)
+  c2 = s32[] constant(2)
+  c100 = s32[] constant(100)
+  s_match = f32[2,4]{1,0} slice(p), slice={[2:4], [0:4]}
+  s_mismatch = f32[2,4]{1,0} slice(p), slice={[1:3], [0:4]}
+  dus_match = f32[8,4]{1,0} dynamic-update-slice(p, s_match, c2, c0)
+  s_dyn = f32[2,4]{1,0} slice(p_dyn), slice={[6:8], [0:4]}
+  dus_dyn = f32[<=8,4]{1,0} dynamic-update-slice(p_dyn, s_dyn, c100, c0)
+  ROOT out = tuple(dus_match, s_mismatch, dus_dyn)
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  const HloInstruction* p = FindInstruction(module.get(), "p");
+  const HloInstruction* p_dyn = FindInstruction(module.get(), "p_dyn");
+  const HloInstruction* s_match = FindInstruction(module.get(), "s_match");
+  const HloInstruction* s_mismatch =
+      FindInstruction(module.get(), "s_mismatch");
+  const HloInstruction* dus_match = FindInstruction(module.get(), "dus_match");
+  const HloInstruction* s_dyn = FindInstruction(module.get(), "s_dyn");
+  const HloInstruction* dus_dyn = FindInstruction(module.get(), "dus_dyn");
+
+  EXPECT_TRUE(IsMatchingInPlaceDusReadSlice(s_match, p, dus_match));
+  EXPECT_FALSE(IsMatchingInPlaceDusReadSlice(s_mismatch, p, dus_match));
+  EXPECT_FALSE(IsMatchingInPlaceDusReadSlice(s_dyn, p_dyn, dus_dyn));
+}
+
 }  // namespace
 }  // namespace xla

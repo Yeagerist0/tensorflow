@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/pjrt/device_event.h"
 #include "xla/pjrt/distributed/coordination/coordination_service.pb.h"
 #include "xla/pjrt/distributed/key_value_store_interface.h"
+#include "xla/pjrt/gpu/allocator_config.h"
 #include "xla/pjrt/gpu/se_gpu_topology_description.h"
 #include "xla/pjrt/host_memory_allocator.h"
 #include "xla/pjrt/maybe_owning_mlir_module.h"
@@ -50,7 +51,6 @@ limitations under the License.
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_compiler.h"
 #include "xla/pjrt/pjrt_executable.h"
-#include "xla/pjrt/plugin/xla_gpu/xla_gpu_allocator_config.h"
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_client_options.h"
 #include "xla/pjrt/raw_buffer.h"
 #include "xla/pjrt/se/buffer_sequencing_event.h"
@@ -70,7 +70,6 @@ limitations under the License.
 #include "xla/tsl/concurrency/ref_count.h"
 #include "xla/tsl/framework/allocator.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/numa.h"
 
 namespace xla {
 
@@ -91,6 +90,7 @@ class StreamExecutorGpuRawClient : public PjRtStreamExecutorRawClient {
       LocalClient* client,
       std::unique_ptr<HostMemoryAllocator> host_memory_allocator,
       bool should_stage_host_to_device_transfers,
+      bool confidential_computing_enabled,
       std::unique_ptr<AsyncWorkRunner> async_work_runner,
       se::StreamExecutor* executor = nullptr,
       std::shared_ptr<KeyValueStoreInterface> kv_store = nullptr,
@@ -98,13 +98,14 @@ class StreamExecutorGpuRawClient : public PjRtStreamExecutorRawClient {
       bool abort_collectives_on_failure = false,
       std::unique_ptr<gpu::GpuExecutableRunOptions> gpu_run_options = nullptr,
       std::shared_ptr<gpu::AllocatorMemoryRegistration> memory_registration =
-          nullptr)
+          nullptr,
+      tsl::RCReference<const GpuMultiSliceConfig> multi_slice_config = {})
       : PjRtStreamExecutorRawClient(
-            std::move(local_device_states), std::move(allocator), client,
-            std::move(host_memory_allocator),
+            platform_id, std::move(local_device_states), std::move(allocator),
+            client, std::move(host_memory_allocator),
             should_stage_host_to_device_transfers, std::move(async_work_runner),
-            executor, std::move(gpu_run_options)),
-        platform_id_(platform_id),
+            executor, std::move(gpu_run_options),
+            confidential_computing_enabled, std::move(multi_slice_config)),
         kv_store_(std::move(kv_store)),
         cache_fabric_handles_(cache_fabric_handles),
         abort_collectives_on_failure_(abort_collectives_on_failure),
@@ -118,7 +119,7 @@ class StreamExecutorGpuRawClient : public PjRtStreamExecutorRawClient {
     return kv_store_;
   }
 
-  void ScheduleRemoteSend(PjRtMemorySpace* memory_space,
+  void ScheduleRemoteSend(LocalDeviceId local_device_id, int memory_kind_id,
                           PjRtRawBufferRef raw_buffer,
                           PjRtDeviceEventRefVector definition_events,
                           PjRtDeviceEventPromiseRef usage_event_promise,
@@ -162,8 +163,6 @@ class StreamExecutorGpuRawClient : public PjRtStreamExecutorRawClient {
   absl::StatusOr<std::shared_ptr<se::DeviceAddressBase>>
   GetOrImportFabricHandle(se::StreamExecutor* executor,
                           absl::string_view fabric_handle);
-
-  PjRtPlatformId platform_id_;
 
   std::shared_ptr<KeyValueStoreInterface> kv_store_;
   // Whether to cache fabric handles. Exporting and importing fabric handles can
@@ -209,9 +208,18 @@ absl::Status ExchangeEmptyStreamExecutorGpuTopology(
     absl::Duration get_global_topology_timeout = absl::Minutes(5));
 
 // Creates allocator memory registration and adds the required suballocator
-// visitors to `allocator_config`.
+// visitors to `allocator_config`. Returns nullptr when registration is off or
+// the pool is not preallocated.
 std::shared_ptr<gpu::AllocatorMemoryRegistration>
 CreateAllocatorMemoryRegistration(GpuAllocatorConfig* allocator_config);
+
+// Memory fraction the BFC allocator is built with: the client's resolved
+// policy unless --xla_gpu_memory_fraction_policy is set, pinned to a
+// FixedMemFraction (with a warning) when
+// --xla_gpu_enable_nccl_user_buffers_in_default_space requires a fixed arena
+// for the shared spatial pool. Fails if the flag does not parse.
+absl::StatusOr<MemFraction> ResolveBfcMemFraction(
+    const GpuAllocatorConfig& allocator_config);
 
 }  // namespace xla
 

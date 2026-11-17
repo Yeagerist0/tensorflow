@@ -52,6 +52,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/parser/hlo_parser.h"
+#include "xla/hlo/transforms/simplifiers/flatten_call_graph.h"
 #include "xla/hlo/transforms/simplifiers/hlo_dce.h"
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/layout_util.h"
@@ -1979,14 +1980,6 @@ absl::StatusOr<HloInstruction*> TransformLoopForward(
         MapNewOperands(instr->operands(), while_body_to_peeled);
     HloInstruction* cloned_instr = loop_computation->AddInstruction(
         instr->CloneWithNewOperands(instr->shape(), new_operands));
-    if (cloned_instr->opcode() == HloOpcode::kWhile) {
-      cloned_instr->set_while_condition(
-          loop_computation->parent()->AddEmbeddedComputation(
-              instr->while_condition()->CloneWithReplacements(nullptr)));
-      cloned_instr->set_while_body(
-          loop_computation->parent()->AddEmbeddedComputation(
-              instr->while_body()->CloneWithReplacements(nullptr)));
-    }
     ABSL_RETURN_IF_ERROR(
         UpdateControlDependencies(instr, cloned_instr, while_body_to_peeled));
     UpdateInstructionChannelId(cloned_instr, next_channel_id,
@@ -2073,6 +2066,7 @@ absl::StatusOr<HloInstruction*> TransformLoopForward(
   HloInstruction* new_while_loop =
       loop_computation->AddInstruction(HloInstruction::CreateWhile(
           loop_state_shape, new_while_condition, new_while_body, new_init));
+  new_while_loop->set_frontend_attributes(while_loop->frontend_attributes());
   ABSL_RETURN_IF_ERROR(while_loop->ReplaceAllUsesWithDifferentShape(new_while_loop));
   ABSL_RETURN_IF_ERROR(
       loop_computation->RemoveInstructionAndUnusedOperands(while_loop));
@@ -2984,6 +2978,7 @@ absl::StatusOr<HloInstruction*> TransformLoopForwardSink(
   HloInstruction* new_while =
       loop_computation->AddInstruction(HloInstruction::CreateWhile(
           new_init->shape(), cloned_cond, cloned_body, new_init));
+  new_while->set_frontend_attributes(while_loop->frontend_attributes());
   // Create the new tuple with the original while tuple size.
   std::vector<HloInstruction*> new_output_tuple;
   new_output_tuple.resize(operands_indices_count, nullptr);
@@ -3301,14 +3296,6 @@ static absl::StatusOr<HloInstruction*> TransformLoopBackward(
       if (cloned_instr == nullptr) {
         cloned_instr = body_builder.AddInstruction(
             instr->CloneWithNewOperands(instr->shape(), new_operands));
-        if (cloned_instr->opcode() == HloOpcode::kWhile) {
-          cloned_instr->set_while_condition(
-              while_loop->GetModule()->AddEmbeddedComputation(
-                  instr->while_condition()->CloneWithReplacements(nullptr)));
-          cloned_instr->set_while_body(
-              while_loop->GetModule()->AddEmbeddedComputation(
-                  instr->while_body()->CloneWithReplacements(nullptr)));
-        }
         ABSL_RETURN_IF_ERROR(UpdateControlDependencies(instr, cloned_instr,
                                                   while_body_replacement_map));
         UpdateInstructionChannelId(cloned_instr, next_channel_id,
@@ -3402,6 +3389,7 @@ static absl::StatusOr<HloInstruction*> TransformLoopBackward(
       while_loop->parent()->AddInstruction(HloInstruction::CreateWhile(
           new_while_body->root_instruction()->shape(), new_while_condition,
           new_while_body, new_loop_init));
+  new_while_loop->set_frontend_attributes(while_loop->frontend_attributes());
   // Clone the loop body in the parent computation of the loop. This is the
   // peeled computation that happens after the loop happened to handle the
   // computation that we peeled away.
@@ -3481,6 +3469,9 @@ absl::StatusOr<bool> CollectivePipeliner::RunPipeliner(
   std::vector<std::pair<HloInstruction*, std::unique_ptr<WhileLoopAnalysis>>>
       loop_analyses;
   for (HloComputation* computation : module->MakeComputationPostOrder()) {
+    if (!computation->HasCalledComputations()) {
+      continue;
+    }
     for (HloInstruction* instruction :
          computation->MakeInstructionPostOrder()) {
       if (instruction->opcode() != HloOpcode::kWhile) {
@@ -3601,6 +3592,9 @@ absl::StatusOr<bool> CollectivePipeliner::RunPipeliner(
           << GetPipelineDirectionString(config_.pipelining_direction);
   // Run necessary cleanup to make sure unused code doesn't trigger HloVerifier.
   if (changed) {
+    ABSL_RETURN_IF_ERROR(FlattenCallGraph(FlattenCallGraph::SkipCloningForCalls)
+                        .Run(module, execution_threads)
+                        .status());
     ABSL_RETURN_IF_ERROR(HloDCE().Run(module, execution_threads).status());
   }
 

@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_SERVICE_GPU_GPU_MEMORY_SPACE_ASSIGNMENT_H_
 
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -25,13 +26,15 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/layout.h"
 #include "xla/service/buffer_assignment.h"
+#include "xla/service/hlo_value.h"
 #include "xla/xla.pb.h"
 
 namespace xla::gpu {
 
-// Frontend attribute names for specifying memory spaces on custom call
-// operands and results. The format is {index:memory_space,...}, e.g.
-// "{0:1,2:1}" means operand/result 0 and 2 should be in memory space 1.
+// Frontend attribute names for specifying memory spaces on custom call and
+// dynamic-slice fusion operands and results. The format is
+// {index:memory_space,...}, e.g. "{0:1,2:1}" means operand/result 0 and 2
+// should be in memory space 1.
 inline constexpr absl::string_view kOperandsMemorySpacesAttr =
     "operands_memory_spaces";
 inline constexpr absl::string_view kResultsMemorySpacesAttr =
@@ -67,14 +70,36 @@ ParseIndexMemorySpacePairs(absl::string_view str);
 // buffers registered with the collective runtime ahead of time.
 bool RequiresCollectiveSymmetricMemorySpace(const HloInstruction* inst);
 
+// Returns true if the given operand use requires collective memory space.
+bool RequiresCollectiveInput(const HloUse& use, const DebugOptions& option);
+
+// Returns true if the given HLO value definition requires collective memory
+// space.
+bool RequiresCollectiveOutput(const HloValue& value,
+                              const DebugOptions& option);
+
 // Creates a buffer colorer that assigns memory space colors to HLO values
 // during buffer assignment. It handles:
 //  - Collective operations (all-reduce, all-gather, etc.) → kCollective
-//  - Custom call `operands_memory_spaces` / `results_memory_spaces` frontend
-//    attributes (e.g. emitted by Mosaic for multimem/symmetric buffers) →
+//  - Custom call and dynamic-slice fusion `operands_memory_spaces` /
+//    `results_memory_spaces` frontend attributes (e.g. for symmetric buffers) →
 //    requested memory space
 //  - Everything else → kDefault
 BufferAssigner::Colorer CreateColorer(const DebugOptions& option);
+
+// Keeps values of collectives that may be recorded into command buffers out of
+// output allocations, so they are not re-recorded on every initialization.
+// Buffer assignment runs before the command buffer conversion pass decides what
+// is recorded, so this also matches collectives that end up outside a command
+// buffer (for example below `xla_gpu_graph_min_graph_size`). Costs temp memory.
+// nullopt unless `xla_gpu_command_buffer_keep_collectives_out_of_outputs` is
+// set and COLLECTIVES is enabled with SKIP_TEMP or SKIP_PROFILED.
+std::optional<BufferAssigner::MustNotLiveOut> CreateMustNotLiveOut(
+    const DebugOptions& option);
+
+// Does not set `temp_buffer_color`, which also depends on the device topology.
+// `option` must outlive the returned options.
+BufferAssigner::Options CreateBufferAssignerOptions(const DebugOptions& option);
 
 }  // namespace xla::gpu
 

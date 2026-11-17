@@ -33,9 +33,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/backends/gpu/runtime/async_thunk.h"
-#include "xla/backends/gpu/runtime/collective_clique_requests.h"
 #include "xla/backends/gpu/runtime/collective_cliques.h"
-#include "xla/backends/gpu/runtime/collective_memory_requests.h"
 #include "xla/backends/gpu/runtime/collective_params.h"
 #include "xla/backends/gpu/runtime/collective_thunk.h"
 #include "xla/backends/gpu/runtime/command.h"
@@ -47,6 +45,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk.pb.h"
 #include "xla/backends/gpu/runtime/thunk_executor.h"
+#include "xla/backends/gpu/runtime/thunk_test_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
@@ -169,7 +168,7 @@ static RaggedAllToAllThunk MakeOneRankThunk(
     buffers.push_back(MakeBuffer(allocations[i], S64, kNumOneRankUpdates));
   }
   return RaggedAllToAllThunk(Thunk::ThunkInfo(), MakeOneRankConfig(),
-                             std::move(buffers));
+                             std::move(buffers), /*devices_per_host=*/1);
 }
 
 static std::vector<se::DeviceAddressBase> AllocateOneRankDeviceBuffers(
@@ -293,30 +292,22 @@ TEST(RaggedAllToAllThunkTest, RecordCommandBufferCreateAndUpdate) {
 
   BufferAllocations allocations1(phase1_buffers, /*device_ordinal=*/0,
                                  allocator.get());
-  CollectiveCliqueRequests clique_requests;
-  CollectiveMemoryRequests memory_requests(allocations1);
-  Thunk::PrepareParams prepare_params{&collective_params, &clique_requests,
-                                      &memory_requests, executor,
-                                      &allocations1};
-  ASSERT_OK(thunk.Prepare(prepare_params));
+  TestThunkParams thunk_params(executor, &allocations1, stream.get());
+  thunk_params.WithRunOptions(&run_options)
+      .WithCommandBufferTraceStream(stream.get())
+      .WithCollectiveParams(&collective_params)
+      .WithLocalDeviceCount(1);
+  ASSERT_OK(thunk.Prepare(thunk_params.PrepareParams()));
   ASSERT_OK_AND_ASSIGN(
       CollectiveCliques collective_cliques,
-      AcquireCollectiveCliques(collective_params, clique_requests));
+      AcquireCollectiveCliques(collective_params,
+                               thunk_params.collective_clique_requests()));
 
-  Thunk::InitializeParams init_params;
-  init_params.executor = executor;
-  init_params.stream = stream.get();
-  init_params.buffer_allocations = &allocations1;
-  init_params.collective_params = &collective_params;
-  init_params.collective_cliques = &collective_cliques;
-  init_params.local_device_count = 1;
-  ASSERT_OK(thunk.Initialize(init_params));
+  thunk_params.WithCollectiveCliques(&collective_cliques);
+  ASSERT_OK(thunk.Initialize(thunk_params.InitializeParams()));
 
   ASSERT_OK(PrepareOneRankInputs(*stream, phase1_buffers, /*phase=*/1));
-  Thunk::ExecuteParams execute_params1 = Thunk::ExecuteParams::Create(
-      run_options, allocations1, stream.get(),
-      /*command_buffer_trace_stream=*/stream.get(), &collective_params,
-      &collective_cliques, /*collective_memory=*/nullptr);
+  Thunk::ExecuteParams execute_params1 = thunk_params.ExecuteParams();
 
   ASSERT_OK(thunk.ExecuteOnStream(execute_params1));
   ASSERT_OK(stream->BlockHostUntilDone());
@@ -340,10 +331,8 @@ TEST(RaggedAllToAllThunkTest, RecordCommandBufferCreateAndUpdate) {
   ASSERT_OK(PrepareOneRankInputs(*stream, phase2_buffers, /*phase=*/2));
   BufferAllocations allocations2(phase2_buffers, /*device_ordinal=*/0,
                                  allocator.get());
-  Thunk::ExecuteParams execute_params2 = Thunk::ExecuteParams::Create(
-      run_options, allocations2, stream.get(),
-      /*command_buffer_trace_stream=*/stream.get(), &collective_params,
-      &collective_cliques, /*collective_memory=*/nullptr);
+  Thunk::ExecuteParams execute_params2 =
+      thunk_params.WithBufferAllocations(&allocations2).ExecuteParams();
 
   std::vector<BufferAllocation::Index> updated_allocs;
   updated_allocs.reserve(kNumRaggedBuffers);
@@ -430,12 +419,13 @@ TEST_F(GpuRaggedAllToAllTest, TestConvertToCommands) {
   // ThunkSequence Creation
   auto ra2a_start_thunk = std::make_unique<RaggedAllToAllThunk>(
       Thunk::ThunkInfo{}, ra2a_instr, std::move(buffers),
-      /*p2p_memcpy_enabled=*/false);
+      /*p2p_memcpy_enabled=*/false, /*devices_per_host=*/1);
 
   ThunkSequence start_sequence;
   start_sequence.push_back(std::move(ra2a_start_thunk));
   auto async_start = std::make_unique<AsyncStartThunk>(
-      Thunk::ThunkInfo(), CommunicationStreamId(0), std::move(start_sequence));
+      Thunk::ThunkInfo(), CommunicationStreamId(0), std::move(start_sequence),
+      /*devices_per_host=*/1);
   auto async_done = std::make_unique<AsyncDoneThunk>(
       Thunk::ThunkInfo(), async_start->async_execution());
 
@@ -540,6 +530,7 @@ TEST(CollectiveThunkTest, ProtoRoundTrip) {
           num_row_elements: 5
           one_shot_kernel_enabled: true
           enable_gxl: true
+          fabric_cost_weight: 0.35
         }
       )pb");
 
@@ -552,7 +543,8 @@ TEST(CollectiveThunkTest, ProtoRoundTrip) {
   ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<RaggedAllToAllThunk> thunk,
       RaggedAllToAllThunk::FromProto(
-          thunk_info, proto.ragged_all_to_all_thunk(), buffer_allocations));
+          thunk_info, proto.ragged_all_to_all_thunk(), buffer_allocations,
+          /*devices_per_host=*/1));
 
   // We're not setting the fast interconnect slice size override in the
   // proto, so it should be nullopt in the thunk.

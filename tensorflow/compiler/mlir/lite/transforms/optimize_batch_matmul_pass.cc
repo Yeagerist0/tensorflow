@@ -24,7 +24,6 @@ limitations under the License.
 #include "mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
 #include "mlir/Dialect/Quant/IR/QuantTypes.h"  // from @llvm-project
 #include "mlir/IR/Attributes.h"  // from @llvm-project
-#include "mlir/IR/BuiltinAttributeInterfaces.h"  // from @llvm-project
 #include "mlir/IR/BuiltinAttributes.h"  // from @llvm-project
 #include "mlir/IR/BuiltinTypes.h"  // from @llvm-project
 #include "mlir/IR/Matchers.h"  // from @llvm-project
@@ -36,7 +35,6 @@ limitations under the License.
 #include "mlir/Support/LogicalResult.h"  // from @llvm-project
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"  // from @llvm-project
 #include "tensorflow/compiler/mlir/lite/ir/tfl_ops.h"
-#include "tensorflow/compiler/mlir/lite/quantization/common/quantization_lib/quantization_utils.h"
 #include "tensorflow/compiler/mlir/lite/transforms/tflite_passes/optimize_batch_matmul_utils.h"
 #include "tensorflow/compiler/mlir/lite/utils/utils.h"
 
@@ -44,9 +42,26 @@ namespace mlir {
 namespace TFL {
 namespace {
 
+// Returns `op` as a bf16/f16 -> f32 cast, or null if it is anything else.
+//
+// Weights kept in a narrow float type reach the matmul behind such a cast,
+// since the kernels only run in f32. Flatbuffer export materializes this cast
+// when its input is a constant, so the cast does not stop the value from being
+// a constant filter.
+CastOp AsFloatWideningCast(mlir::Operation* op) {
+  auto cast_op = mlir::dyn_cast_or_null<CastOp>(op);
+  if (!cast_op) return nullptr;
+  mlir::Type in_elem = getElementTypeOrSelf(cast_op.getInput().getType());
+  mlir::Type out_elem = getElementTypeOrSelf(cast_op.getType());
+  if (!(in_elem.isBF16() || in_elem.isF16()) || !out_elem.isF32()) {
+    return nullptr;
+  }
+  return cast_op;
+}
+
 // Checks whether `value` is, or can be folded into, a constant. This covers a
 // plain constant, the dequantize wrappers a quantized constant weight hides
-// behind, and chains of ops that only rearrange one of those.
+// behind, and chains of ops that only rearrange or widen one of those.
 bool IsFromFoldableChain(mlir::Value value) {
   mlir::Operation* defining_op = value.getDefiningOp();
 
@@ -66,6 +81,8 @@ bool IsFromFoldableChain(mlir::Value value) {
       defining_op = split_op.getValue().getDefiningOp();
     } else if (auto transpose_op = mlir::dyn_cast<TransposeOp>(defining_op)) {
       defining_op = transpose_op.getInput().getDefiningOp();
+    } else if (auto cast_op = AsFloatWideningCast(defining_op)) {
+      defining_op = cast_op.getInput().getDefiningOp();
     } else {
       // Stop if the op does not preserve constant nature.
       break;
@@ -86,6 +103,9 @@ bool IsFromFoldableChain(mlir::Value value) {
 bool IsRhsFoldableIntoFullyConnected(mlir::Value value) {
   auto ranked_type = mlir::dyn_cast<RankedTensorType>(value.getType());
   if (!ranked_type || ranked_type.getRank() != 2) {
+    return false;
+  }
+  if (mlir::isa<BlockwiseQuantType>(ranked_type.getElementType())) {
     return false;
   }
 
@@ -114,6 +134,19 @@ struct ConvertBatchMatMulOp2FullyConnectedOp_Rank2ConstantRhs
           bmm_op,
           "rhs is neither a rank 2 value foldable into a constant nor a rank 2 "
           "signed int4/int8 quantized value.");
+    }
+    // The filter transpose of a shared blockwise-dequantized rhs cannot be
+    // pushed into its constant operands, which would leave a float filter;
+    // such a static-range quantized matmul stays a blockwise quantized
+    // batch_matmul instead.
+    if (mlir::isa_and_nonnull<DequantizeOp>(bmm_op.getX().getDefiningOp()) &&
+        mlir::isa_and_nonnull<BlockwiseDequantizeOp>(
+            bmm_op.getY().getDefiningOp()) &&
+        !bmm_op.getY().hasOneUse()) {
+      return rewriter.notifyMatchFailure(
+          bmm_op,
+          "SRQ batch_matmul with a shared blockwise-dequantized rhs stays "
+          "batch_matmul");
     }
 
     // Create a tfl.transpose op that performs ZX transpose on `input`.
@@ -193,8 +226,24 @@ struct ConvertBatchMatMulOp2FullyConnectedOp_Rank2ConstantRhs
 
     // The rhs need to be transposed if adj_y == false AND this matmul will be
     // legalized to tfl.fully_connected
-    Value output_rhs =
-        !bmm_op.getAdjY() ? create_z_x_transpose_op(input_rhs) : input_rhs;
+    Value output_rhs = input_rhs;
+    if (!bmm_op.getAdjY()) {
+      // Transpose below a widening cast rather than above it. Only a
+      // transpose directly on a constant gets folded away, and the cast is
+      // then left directly on the constant too, which flatbuffer export
+      // materializes.
+      if (CastOp cast_op = AsFloatWideningCast(input_rhs.getDefiningOp())) {
+        Value transposed = create_z_x_transpose_op(cast_op.getInput());
+        auto transposed_type =
+            mlir::cast<RankedTensorType>(transposed.getType());
+        output_rhs = TFL::CastOp::create(
+            rewriter, cast_op.getLoc(),
+            transposed_type.clone(getElementTypeOrSelf(cast_op.getType())),
+            transposed);
+      } else {
+        output_rhs = create_z_x_transpose_op(input_rhs);
+      }
+    }
 
     Type output_type = bmm_op.getResult().getType();
     auto no_input =

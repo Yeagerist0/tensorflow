@@ -20,6 +20,7 @@ limitations under the License.
 #include <optional>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/cord.h"
@@ -39,8 +40,6 @@ namespace ifrt {
 // Ideally, compile options should be present in the program being compiled to
 // help static checking and completeness. This option structure is to express
 // legacy compilation options that are not included in the program.
-//
-// TODO(hyeontaek): Make an new `LoadOptions` that is specific for loading.
 struct CompileOptions : RTTIExtends<CompileOptions, Serializable> {
   static char ID;  // NOLINT
 
@@ -97,7 +96,7 @@ class Compiler : public RTTIExtends<Compiler, RTTIRoot> {
   // function.
   virtual tsl::Future<LoadedExecutableRef> DeserializeLoadedExecutable(
       const absl::Cord& serialized,
-      std::unique_ptr<DeserializeExecutableOptions> options) = 0;
+      absl_nullable std::unique_ptr<DeserializeExecutableOptions> options) = 0;
 
   static char ID;  // NOLINT
 };

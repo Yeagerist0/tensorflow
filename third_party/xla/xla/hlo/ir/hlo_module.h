@@ -35,8 +35,9 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/cord.h"
-#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
@@ -267,8 +268,9 @@ class HloModule {
     // Use MakeComputationSorted() instead of MakeComputationPostOrder()
     // because naming may affect the order of MakeComputationPostOrder() but not
     // MakeComputationSorted().
-    auto computations = module.MakeComputationSorted();
-    for (auto* computation : computations) {
+    const std::vector<HloComputation*> computations =
+        module.MakeComputationSorted();
+    for (const HloComputation* computation : computations) {
       h = H::combine(std::move(h), *computation);
     }
     return H::combine(std::move(h), computations.size());
@@ -490,10 +492,10 @@ class HloModule {
   // (We express the default options using an overload rather than a default
   // param because gdb ignores default params, but does resolve overloads.)
   void Print(Printer* printer) const {
-    return Print(printer, HloPrintOptions::Default(), {});
+    Print(printer, HloPrintOptions::Default(), {});
   }
   void Print(Printer* printer, const HloPrintOptions& options) const {
-    return Print(printer, options, {});
+    Print(printer, options, {});
   }
   void Print(
       Printer* printer, const HloPrintOptions& options,
@@ -557,7 +559,7 @@ class HloModule {
 
   HloModuleProto ToProto(HloProtoOptions options = HloProtoOptions()) const {
     HloModuleProto proto;
-    ToProto(&proto, options);
+    ToProto(&proto, std::move(options));
     return proto;
   }
 
@@ -587,7 +589,7 @@ class HloModule {
   HloModuleProtoWithConfig ToProtoWithConfig(
       HloProtoOptions options = HloProtoOptions()) const {
     HloModuleProtoWithConfig proto;
-    ToProtoWithConfig(&proto, options);
+    ToProtoWithConfig(&proto, std::move(options));
     return proto;
   }
 
@@ -724,9 +726,8 @@ class HloModule {
     CHECK(spmd_parameters_shardings_.has_value());
     return *spmd_parameters_shardings_;
   }
-  void set_spmd_parameters_shardings(
-      const std::vector<HloSharding>& shardings) {
-    spmd_parameters_shardings_ = shardings;
+  void set_spmd_parameters_shardings(absl::Span<const HloSharding> shardings) {
+    spmd_parameters_shardings_.emplace(shardings.begin(), shardings.end());
   }
 
   // Checks if this config has the entry computation output's HLO sharding for
@@ -856,8 +857,8 @@ class HloModule {
   }
 
   void set_profile_info(
-      const std::vector<HloModuleProto::ProfileInfo>& profile_info) {
-    profile_info_list_ = profile_info;
+      absl::Span<const HloModuleProto::ProfileInfo> profile_info) {
+    profile_info_list_.assign(profile_info.begin(), profile_info.end());
   }
 
   const std::vector<HloModuleProto::ProfileInfo>& profile_info() const {
@@ -897,6 +898,14 @@ class HloModule {
   }
 
   std::string autofdo_fingerprint() const { return autofdo_fingerprint_; }
+
+  void set_unoptimized_fingerprint(absl::string_view fingerprint) {
+    unoptimized_fingerprint_ = std::string(fingerprint);
+  }
+
+  absl::string_view unoptimized_fingerprint() const {
+    return unoptimized_fingerprint_;
+  }
 
   CompilationEnvironments& comp_envs() const { return *comp_envs_; }
 
@@ -1099,6 +1108,9 @@ class HloModule {
 
   // The unoptimized module fingerprint.
   std::string autofdo_fingerprint_;
+
+  // The unoptimized module fingerprint returned by SymbolUploader.
+  std::string unoptimized_fingerprint_;
 
   // The keys used to retrieve the optimization profiles this module is compiled
   // with, per profile type.

@@ -19,6 +19,7 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 load("@llvm-raw//utils/bazel:configure.bzl", "llvm_configure")
 load("@llvm-raw//utils/bazel:linux_uapi.bzl", "linux_uapi_setup")
 load("//third_party:repo.bzl", "tf_mirror_urls")
+load("//third_party/xz:workspace.bzl", xz = "repo")
 
 _PYYAML_CONTENT = """\
 load("@rules_python//python:defs.bzl", "py_library")
@@ -61,9 +62,10 @@ _llvm_zstd_compat = repository_rule(
     implementation = _llvm_zstd_compat_impl,
 )
 
-def _llvm_extension_impl(mctx):  # @unused
+def _llvm_extension_impl(mctx):
     _llvm_zlib_compat(name = "llvm_zlib")
     _llvm_zstd_compat(name = "llvm_zstd")
+    xz()
     linux_uapi_setup(name = "linux_uapi")
     http_archive(
         name = "pyyaml",
@@ -88,6 +90,7 @@ def _llvm_extension_impl(mctx):  # @unused
             "SPIRV",
         ],
     )
+    return mctx.extension_metadata(reproducible = True)
 
 llvm_extension = module_extension(
     implementation = _llvm_extension_impl,

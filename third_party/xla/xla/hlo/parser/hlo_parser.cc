@@ -57,7 +57,6 @@ limitations under the License.
 #include "xla/comparison_util.h"
 #include "xla/hlo/ir/collective_op_group_mode.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
-#include "xla/hlo/ir/hlo_domain_metadata.h"
 #include "xla/hlo/ir/hlo_input_output_alias_config.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instruction_utils.h"
@@ -68,7 +67,6 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_original_value_util.h"
 #include "xla/hlo/ir/hlo_schedule.h"
 #include "xla/hlo/ir/hlo_sharding.h"
-#include "xla/hlo/ir/hlo_sharding_metadata.h"
 #include "xla/hlo/ir/mesh_and_axis.h"
 #include "xla/hlo/ir/named_sharding.h"
 #include "xla/hlo/ir/replica_group.h"
@@ -155,13 +153,15 @@ bool CanInferShape(HloOpcode code) {
     case HloOpcode::kCosh:
     case HloOpcode::kOptimizationBarrier:
     case HloOpcode::kDivide:
-    case HloOpcode::kDomain:
     case HloOpcode::kDot:
+    case HloOpcode::kDotGeneral:
     case HloOpcode::kErf:
     case HloOpcode::kExp:
+    case HloOpcode::kExp2:
     case HloOpcode::kExpm1:
     case HloOpcode::kFft:
     case HloOpcode::kFloor:
+    case HloOpcode::kFma:
     case HloOpcode::kGather:
     case HloOpcode::kGetDimensionSize:
     case HloOpcode::kSetDimensionSize:
@@ -170,6 +170,7 @@ bool CanInferShape(HloOpcode code) {
     case HloOpcode::kIsFinite:
     case HloOpcode::kLog:
     case HloOpcode::kLog1p:
+    case HloOpcode::kLog2:
     case HloOpcode::kLogistic:
     case HloOpcode::kAnd:
     case HloOpcode::kNot:
@@ -340,7 +341,6 @@ class HloParserImpl : public HloParser {
     kMetadata,
     kFusionKind,
     kDistribution,
-    kDomain,
     kPrecisionList,
     kShape,
     kShapeList,
@@ -469,12 +469,6 @@ class HloParserImpl : public HloParser {
     std::vector<int64_t> strides;
   };
 
-  // The data parsed for the kDomain instruction.
-  struct DomainData {
-    std::unique_ptr<DomainMetadata> entry_metadata;
-    std::unique_ptr<DomainMetadata> exit_metadata;
-  };
-
   // attributes ::= (',' attribute)*
   //
   // Parses attributes given names and configs of the attributes. Each parsed
@@ -578,9 +572,6 @@ class HloParserImpl : public HloParser {
   bool ParseBooleanListOrSingleBoolean(BoolList* boolean_list);
   bool ParseReplicaGroupsOnly(std::vector<ReplicaGroup>* replica_groups);
 
-  // Parses the metadata behind a kDOmain instruction.
-  bool ParseDomain(DomainData* domain);
-
   // Parses a sub-attribute of the window attribute, e.g.,size=1x2x3.
   bool ParseDxD(const std::string& name, std::vector<int64_t>* result);
   // Parses window's pad sub-attribute, e.g., pad=0_0x3x3.
@@ -634,7 +625,7 @@ class HloParserImpl : public HloParser {
   bool ParsePrimitiveType(PrimitiveType* result);
   bool ParseComparisonDirection(ComparisonDirection* result);
   bool ParseComparisonOrder(Comparison::Order* result);
-  bool ParseComparisonType(Comparison::Type* result);
+  bool ParseComparisonType(Comparison::Order* result);
   bool ParseFusionKind(HloInstruction::FusionKind* result);
   bool ParseRandomDistribution(RandomDistribution* result);
   bool ParseConvKind(ConvolutionKind* result);
@@ -762,6 +753,11 @@ class HloParserImpl : public HloParser {
   // Tracks recursion depth to prevent stack overflow from deeply nested input.
   int current_recursion_depth_ = 0;
   StackFrameIndexProto stack_frame_index_proto_;
+
+  // Next values used to fill elided constants (`{...}`) when
+  // fill_shortform_constants_with_random_values() is set.
+  uint32_t shortform_fill_word_ = 0;
+  uint8_t shortform_fill_byte_ = 0;
 };
 
 bool SplitToInt64s(absl::string_view s, char delim, std::vector<int64_t>* out) {
@@ -1665,39 +1661,42 @@ bool HloParserImpl::ParseInstructionRhs(HloComputation::Builder* builder,
       }
     }
   }
+  // In the syntax sugar form (`<op>-start`, `<op>-update`, `<op>-done`), the
+  // wrapped computation is synthesized without its own attribute list, so the
+  // async ops' shared attributes also populate the wrapped instruction, the
+  // last op of the chain winning. In the full form (`calls=`), the wrapped
+  // computation was already parsed with its own attributes.
+  HloInstruction* const wrapped = async_wrapped_opcode.has_value()
+                                      ? instruction->async_wrapped_instruction()
+                                      : nullptr;
   if (metadata) {
     instruction->set_metadata(*metadata);
-    if (instruction->IsAsynchronous()) {
-      instruction->async_wrapped_instruction()->set_metadata(*metadata);
+    if (wrapped != nullptr) {
+      wrapped->set_metadata(*metadata);
     }
   }
   if (original_value) {
     instruction->set_original_value(*original_value);
-    if (instruction->IsAsynchronous()) {
-      instruction->async_wrapped_instruction()->set_original_value(
-          *original_value);
+    if (wrapped != nullptr) {
+      wrapped->set_original_value(*original_value);
     }
   }
   if (backend_config) {
     instruction->set_raw_backend_config_string(*backend_config);
-    if (instruction->IsAsynchronous()) {
-      instruction->async_wrapped_instruction()->set_raw_backend_config_string(
-          *backend_config);
+    if (wrapped != nullptr) {
+      wrapped->set_raw_backend_config_string(*backend_config);
     }
   }
   if (frontend_attributes) {
     instruction->set_frontend_attributes(*frontend_attributes);
-    if (instruction->IsAsynchronous() &&
-        instruction->async_wrapped_instruction() != nullptr) {
-      instruction->async_wrapped_instruction()->set_frontend_attributes(
-          *frontend_attributes);
+    if (wrapped != nullptr) {
+      wrapped->set_frontend_attributes(*frontend_attributes);
     }
   }
   if (statistics_viz) {
     instruction->set_statistics_viz(*statistics_viz);
-    if (instruction->IsAsynchronous()) {
-      instruction->async_wrapped_instruction()->set_statistics_viz(
-          *statistics_viz);
+    if (wrapped != nullptr) {
+      wrapped->set_statistics_viz(*statistics_viz);
     }
   }
 
@@ -1845,9 +1844,11 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
     case HloOpcode::kAsin:
     case HloOpcode::kAsinh:
     case HloOpcode::kAtanh:
+    case HloOpcode::kExp2:
     case HloOpcode::kExpm1:
     case HloOpcode::kLog:
     case HloOpcode::kLog1p:
+    case HloOpcode::kLog2:
     case HloOpcode::kLogistic:
     case HloOpcode::kSqrt:
     case HloOpcode::kCbrt:
@@ -1920,6 +1921,7 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
     }
     // Ternary ops.
     case HloOpcode::kClamp:
+    case HloOpcode::kFma:
     case HloOpcode::kSelect: {
       if ((!preset_operands &&
            !ParseOperands(&operands, builder, /*expected_size=*/3)) ||
@@ -2287,14 +2289,18 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
           // and pass them to construct the async-wrapped computation.
           // Any mismatch between the actual operands and the expected shapes
           // in the wrapped computation will be caught by the verifier.
-          async_computation = CreateAsyncWrappedComputation(
-              *async_wrapped_opcode, /*result_shape=*/shape->tuple_shapes(1),
-              /*operand_shapes=*/shape->tuple_shapes(0).tuple_shapes(), attrs,
-              allow_attributes);
-
-          if (!async_computation) {
+          HloComputation* async_wrapped_computation =
+              CreateAsyncWrappedComputation(
+                  *async_wrapped_opcode,
+                  /*result_shape=*/shape->tuple_shapes(1),
+                  /*operand_shapes=*/shape->tuple_shapes(0).tuple_shapes(),
+                  attrs, allow_attributes);
+          // Check the raw pointer: storing it would engage the optional even
+          // when it is null.
+          if (async_wrapped_computation == nullptr) {
             return nullptr;
           }
+          async_computation = async_wrapped_computation;
         } else {
           // Since async-{update,done} will inherit the computation from
           // async-start, we'll only need to make sure it matches what was
@@ -2683,8 +2689,8 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
         return nullptr;
       }
       if (!maybe_infer_shape([&] {
-            return ShapeUtil::GetTupleElementShape(operands[0]->shape(),
-                                                   *index);
+            return ShapeInference::InferGetTupleElementShape(
+                operands[0]->shape(), *index);
           })) {
         return nullptr;
       }
@@ -2731,13 +2737,13 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
       if (!window) {
         window.emplace();
       }
+      if (operands.empty()) {
+        TokenError("reduce-window expects at least one input and init operand");
+        return nullptr;
+      }
       if (operands.size() % 2) {
         TokenError(StrCat("expects an even number of operands, but has ",
                           operands.size(), " operands"));
-        return nullptr;
-      }
-      if (operands.empty()) {
-        TokenError("reduce-window expects at least one input and init operand");
         return nullptr;
       }
       if (!maybe_infer_shape([&] {
@@ -2870,7 +2876,7 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
     case HloOpcode::kCompare: {
       optional<ComparisonDirection> direction;
       optional<ComparisonOrder> order;
-      optional<Comparison::Type> type;
+      optional<ComparisonOrder> type;
       attrs["direction"] = {/*required=*/true, AttrTy::kComparisonDirection,
                             &direction};
       attrs["order"] = {/*required=*/false, AttrTy::kComparisonOrder, &order};
@@ -2897,8 +2903,7 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
       }
       if (type.has_value()) {
         return builder->AddInstruction(HloInstruction::CreateCompare(
-            *shape, operands[0], operands[1], *direction,
-            Comparison::DefaultOrdering(*type)));
+            *shape, operands[0], operands[1], *direction, *type));
       }
       return builder->AddInstruction(HloInstruction::CreateCompare(
           *shape, operands[0], operands[1], *direction));
@@ -3704,7 +3709,8 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
       *custom_call_instr->mutable_precision_config() = precision_config;
       return instruction;
     }
-    case HloOpcode::kDot: {
+    case HloOpcode::kDot:
+    case HloOpcode::kDotGeneral: {
       optional<std::vector<int64_t>> lhs_contracting_dims;
       attrs["lhs_contracting_dims"] = {
           /*required=*/false, AttrTy::kBracedInt64List, &lhs_contracting_dims};
@@ -3725,8 +3731,20 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
       attrs["algorithm"] = {/*required=*/false, AttrTy::kPrecisionAlgorithm,
                             &algorithm};
 
+      optional<SparsityConfig> parsed_sparsity_config;
+      attrs["sparsity_config"] = {/*required=*/false, AttrTy::kSparsityConfig,
+                                  &parsed_sparsity_config};
+      optional<BlockScalingConfig> parsed_block_scaling_config;
+      attrs["block_scaling_config"] = {/*required=*/false,
+                                       AttrTy::kBlockScalingConfig,
+                                       &parsed_block_scaling_config};
+
       if ((!preset_operands && !ParseOperands(&operands, builder)) ||
           !ParseAttributes(attrs, allow_attributes, shape)) {
+        return nullptr;
+      }
+      if (operands.size() < 2) {
+        Error(lexer_.GetLoc(), "expects at least 2 operands");
         return nullptr;
       }
 
@@ -3753,21 +3771,30 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
         *precision_config.mutable_operand_precision() = {
             operand_precision->begin(), operand_precision->end()};
       } else {
+        // A dot-general only has precisions for lhs and rhs.
         precision_config.mutable_operand_precision()->Resize(
-            operands.size(), PrecisionConfig::DEFAULT);
+            opcode == HloOpcode::kDotGeneral ? 2 : operands.size(),
+            PrecisionConfig::DEFAULT);
       }
       if (algorithm) {
         precision_config.set_algorithm(*algorithm);
       }
+      SparsityConfig sp = parsed_sparsity_config.value_or(SparsityConfig());
+      BlockScalingConfig bs =
+          parsed_block_scaling_config.value_or(BlockScalingConfig());
       if (!maybe_infer_shape([&] {
             return ShapeInference::InferDotOpShape(
                 operands[0]->shape(), operands[1]->shape(), dnum,
-                /*preferred_element_type=*/std::nullopt);
+                /*preferred_element_type=*/std::nullopt, sp);
           })) {
         return nullptr;
       }
+      if (opcode == HloOpcode::kDotGeneral) {
+        return builder->AddInstruction(HloInstruction::CreateDotGeneral(
+            *shape, operands, dnum, precision_config, sp, bs));
+      }
       return builder->AddInstruction(HloInstruction::CreateDot(
-          *shape, operands[0], operands[1], dnum, precision_config));
+          *shape, operands, dnum, precision_config, sp, bs));
     }
     case HloOpcode::kRaggedDot: {
       optional<std::vector<int64_t>> lhs_contracting_dims;
@@ -4058,23 +4085,6 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
           operand_span.last(input_count), *update_computation, dim_numbers,
           indices_are_sorted.value(), unique_indices.value()));
     }
-    case HloOpcode::kDomain: {
-      DomainData domain;
-      attrs["domain"] = {/*required=*/true, AttrTy::kDomain, &domain};
-      if ((!preset_operands &&
-           !ParseOperands(&operands, builder, /*expected_size=*/1)) ||
-          !ParseAttributes(attrs, allow_attributes, shape)) {
-        return nullptr;
-      }
-      if (!maybe_infer_shape([&] {
-            return ShapeInference::InferUnaryOpShape(opcode, operands[0]);
-          })) {
-        return nullptr;
-      }
-      return builder->AddInstruction(HloInstruction::CreateDomain(
-          *shape, operands[0], std::move(domain.exit_metadata),
-          std::move(domain.entry_metadata)));
-    }
     case HloOpcode::kGetDimensionSize: {
       optional<std::vector<int64_t>> dimensions;
       attrs["dimensions"] = {/*required=*/true, AttrTy::kBracedInt64List,
@@ -4139,10 +4149,11 @@ bool HloParserImpl::ParseCollectiveDeviceListBase(
     return true;
   }
 
-  // If the first token is 'mesh' or 'maximal_mesh', then we are parsing a (v3)
-  // MeshAxesReplicaGroupList.
+  // If the first token is 'mesh', 'single_device', or 'maximal_mesh', then we
+  // are parsing a (v3) MeshAxesReplicaGroupList.
   if (lexer_.GetKind() == TokKind::kIdent &&
-      (lexer_.GetStrVal() == "mesh" || lexer_.GetStrVal() == "maximal_mesh")) {
+      (lexer_.GetStrVal() == "mesh" || lexer_.GetStrVal() == "single_device" ||
+       lexer_.GetStrVal() == "maximal_mesh")) {
     std::optional<Mesh> mesh;
     if (!ParseMesh(mesh)) {
       return false;
@@ -4318,19 +4329,22 @@ bool HloParserImpl::ParseMesh(std::optional<Mesh>& mesh) {
   std::string kind = lexer_.GetStrVal();
   lexer_.Lex();
 
-  if (kind == "maximal_mesh") {
-    if (!ParseToken(TokKind::kLsquare, "expected '[' after maximal_mesh")) {
+  if (kind == "single_device" || kind == "maximal_mesh") {
+    if (!ParseToken(TokKind::kLsquare,
+                    absl::StrCat("expected '[' after ", kind))) {
       return false;
     }
     std::string device_ids_str;
     if (!ParseAttributeName(&device_ids_str) || device_ids_str != "device_id") {
-      return TokenError("expected device_id= attribute in maximal_mesh");
+      return TokenError(
+          absl::StrCat("expected device_id= attribute in ", kind));
     }
     int64_t device_id;
     if (!ParseInt64(&device_id)) {
       return false;
     }
-    if (!ParseToken(TokKind::kRsquare, "expected ']' to end maximal_mesh")) {
+    if (!ParseToken(TokKind::kRsquare,
+                    absl::StrCat("expected ']' to end ", kind))) {
       return false;
     }
     mesh.emplace(device_id);
@@ -4338,7 +4352,7 @@ bool HloParserImpl::ParseMesh(std::optional<Mesh>& mesh) {
   }
 
   if (kind != "mesh") {
-    return TokenError("Expected 'mesh' or 'maximal_mesh'");
+    return TokenError("Expected 'mesh', 'single_device', or 'maximal_mesh'");
   }
 
   // Parse @mesh[...]
@@ -4608,8 +4622,8 @@ bool HloParserImpl::ParseSingleSharding(
     return true;
   };
 
-  // Maximal sharding
-  if (mesh->IsMaximal()) {
+  // Single-device sharding
+  if (mesh->IsSingleDevice()) {
     std::vector<OpMetadata> metadata;
     if (!parse_metadata_if_present(metadata)) {
       return false;
@@ -4875,7 +4889,8 @@ bool HloParserImpl::ParseSingleSharding(std::optional<HloSharding>& sharding,
   }
 
   if (lexer_.GetKind() == TokKind::kIdent &&
-      (lexer_.GetStrVal() == "mesh" || lexer_.GetStrVal() == "maximal_mesh")) {
+      (lexer_.GetStrVal() == "mesh" || lexer_.GetStrVal() == "single_device" ||
+       lexer_.GetStrVal() == "maximal_mesh")) {
     std::optional<NamedSharding> named_sharding;
     if (ParseSingleSharding(named_sharding)) {
       sharding = HloSharding(std::move(*named_sharding));
@@ -5030,6 +5045,12 @@ bool HloParserImpl::ParseSingleSharding(std::optional<HloSharding>& sharding,
       CHECK(subgroup_types.empty());
       subgroup_types.push_back(OpSharding::REPLICATED);
     }
+    if (subgroup_types.size() > tile_assignment_dimensions.size()) {
+      return Error(
+          loc, absl::StrCat("last_tile_dims has ", subgroup_types.size(),
+                            " entries, but the tile assignment only has ",
+                            tile_assignment_dimensions.size(), " dimensions"));
+    }
     if (!iota_reshape_dims.empty()) {
       CHECK(devices.empty());
       if (Product(tile_assignment_dimensions) != Product(iota_reshape_dims)) {
@@ -5170,34 +5191,6 @@ bool HloParserImpl::ParseReplicaGroupsOnly(
   return true;
 }
 
-// domain ::= '{' 'kind=' domain_kind ',' 'entry=' entry_sharding ','
-//            'exit=' exit_sharding '}'
-bool HloParserImpl::ParseDomain(DomainData* domain) {
-  absl::btree_map<std::string, AttrConfig> attrs;
-  optional<std::string> kind;
-  optional<HloSharding> entry_sharding;
-  optional<HloSharding> exit_sharding;
-  attrs["kind"] = {/*required=*/true, AttrTy::kString, &kind};
-  attrs["entry"] = {/*required=*/true, AttrTy::kSharding, &entry_sharding};
-  attrs["exit"] = {/*required=*/true, AttrTy::kSharding, &exit_sharding};
-  if (!ParseSubAttributes(attrs)) {
-    return false;
-  }
-  if (*kind == ShardingMetadata::KindName()) {
-    auto entry_sharding_ptr =
-        std::make_unique<HloSharding>(std::move(*entry_sharding));
-    auto exit_sharding_ptr =
-        std::make_unique<HloSharding>(std::move(*exit_sharding));
-    domain->entry_metadata =
-        std::make_unique<ShardingMetadata>(std::move(entry_sharding_ptr));
-    domain->exit_metadata =
-        std::make_unique<ShardingMetadata>(std::move(exit_sharding_ptr));
-  } else {
-    return TokenError(StrCat("unsupported domain kind: ", *kind));
-  }
-  return true;
-}
-
 // '{' name+ '}'
 bool HloParserImpl::ParseInstructionNames(
     std::vector<HloInstruction*>* instructions) {
@@ -5211,7 +5204,12 @@ bool HloParserImpl::ParseInstructionNames(
     if (!ParseName(&name)) {
       return Error(loc, "expects a instruction name");
     }
-    std::pair<HloInstruction*, LocTy>* instr = FindInstruction(name);
+    std::optional<Shape> default_shape;
+    if (tsl::gtl::FindOrNull(current_name_table(), name) == nullptr) {
+      default_shape = ShapeUtil::MakeNil();
+    }
+    std::pair<HloInstruction*, LocTy>* instr =
+        FindInstruction(name, default_shape);
     if (!instr) {
       return TokenError(StrFormat("instruction '%s' is not defined", name));
     }
@@ -5732,11 +5730,13 @@ bool HloParserImpl::ParseDenseLiteral(Literal* literal, const Shape& shape) {
         if (!options_.fill_shortform_constants_with_random_values()) {
           break;
         }
-        // Fill data with deterministic (garbage) values. Use static to avoid
-        // creating identical constants which could potentially got CSE'ed
-        // away. This is a best-effort approach to make sure replaying a HLO
-        // gives us same optimized HLO graph.
-        static uint32_t data = 0;
+        // Fill data with deterministic (garbage) values. The counters keep
+        // running across the elided constants of one parse, so constants of
+        // the same shape get different values and are not CSE'ed away. They
+        // are parser members rather than statics, so every parse of the same
+        // text produces the same values, regardless of what was parsed before
+        // or on which thread. This is a best effort approach to make sure
+        // replaying an HLO gives us the same optimized HLO graph.
 
         // According to the System V ABI not all 8 bit values are valid booleans
         // - only the values 0 and 1 are allowed. So to avoid undefined
@@ -5750,13 +5750,14 @@ bool HloParserImpl::ParseDenseLiteral(Literal* literal, const Shape& shape) {
             (shape.element_type() == PRED) ? kBooleanMask : kNoMask;
 
         uint32_t* raw_data = static_cast<uint32_t*>(literal->untyped_data());
-        for (int64_t i = 0; i < literal->size_bytes() / 4; ++i) {
-          raw_data[i] = data++ & mask;
+        const int64_t num_words = literal->size_bytes() / 4;
+        for (int64_t i = 0; i < num_words; ++i) {
+          raw_data[i] = shortform_fill_word_++ & mask;
         }
+        // The bytes after the last whole word.
         uint8_t* raw_data_int8 = static_cast<uint8_t*>(literal->untyped_data());
-        static uint8_t data_int8 = 0;
-        for (int64_t i = 0; i < literal->size_bytes() % 4; ++i) {
-          raw_data_int8[literal->size_bytes() / 4 + i] = data_int8++ & mask;
+        for (int64_t i = num_words * 4; i < literal->size_bytes(); ++i) {
+          raw_data_int8[i] = shortform_fill_byte_++ & mask;
         }
         break;
       }
@@ -6201,11 +6202,12 @@ bool HloParserImpl::ParseAttributeHelper(
         return true;
       }
       case AttrTy::kComparisonType: {
-        Comparison::Type result;
+        Comparison::Order result;
         if (!ParseComparisonType(&result)) {
           return false;
         }
-        static_cast<optional<Comparison::Type>*>(attr_out_ptr)->emplace(result);
+        static_cast<optional<Comparison::Order>*>(attr_out_ptr)
+            ->emplace(result);
         return true;
       }
       case AttrTy::kEnum: {
@@ -6418,9 +6420,6 @@ bool HloParserImpl::ParseAttributeHelper(
         static_cast<optional<RandomDistribution>*>(attr_out_ptr)
             ->emplace(result);
         return true;
-      }
-      case AttrTy::kDomain: {
-        return ParseDomain(static_cast<DomainData*>(attr_out_ptr));
       }
       case AttrTy::kPrecisionList: {
         std::vector<PrecisionConfig::Precision> result;
@@ -7288,17 +7287,22 @@ bool HloParserImpl::ParseDimLevelTypes(
 //   ::= 'T' ('(' dim_list ')')+
 // dim_list
 //   ::= /*empty*/
-//   ::= (int64_t | '*') (',' (int64_t | '*'))*
+//   ::= (int64_t | '*' | 'd') (',' (int64_t | '*' | 'd'))*
 bool HloParserImpl::ParseTiles(std::vector<Tile>* tiles) {
   auto parse_and_add_tile_dimension = [&]() {
-    int64_t i;
-    if (ParseInt64(&i)) {
-      tiles->back().add_dimensions(i);
-      return true;
-    }
     if (lexer_.GetKind() == TokKind::kAsterisk) {
       tiles->back().add_dimensions(Tile::kCombineDimension);
       lexer_.Lex();
+      return true;
+    }
+    if (lexer_.GetKind() == TokKind::kIdent && lexer_.GetStrVal() == "d") {
+      tiles->back().add_dimensions(Tile::kMatchDimension);
+      lexer_.Lex();
+      return true;
+    }
+    int64_t i;
+    if (ParseInt64(&i)) {
+      tiles->back().add_dimensions(i);
       return true;
     }
     return false;
@@ -7880,6 +7884,14 @@ bool HloParserImpl::ParseTensorBlockScalingConfig(
         }
         for (int64_t s : steps) {
           result->add_steps(s);
+        }
+      } else if (attribute == "block_sizes") {
+        std::vector<int64_t> block_sizes;
+        if (!ParseDxD("block_sizes", &block_sizes)) {
+          return Error(lexer_.GetLoc(), "expects block_sizes in form NxMxK");
+        }
+        for (int64_t b : block_sizes) {
+          result->add_block_sizes(b);
         }
       } else {
         return Error(lexer_.GetLoc(), "unknown attribute");
@@ -8507,13 +8519,13 @@ bool HloParserImpl::ParseComparisonOrder(Comparison::Order* result) {
   return true;
 }
 
-bool HloParserImpl::ParseComparisonType(Comparison::Type* result) {
+bool HloParserImpl::ParseComparisonType(Comparison::Order* result) {
   VLOG(kDebugLevel) << "ParseComparisonType";
   if (lexer_.GetKind() != TokKind::kIdent) {
     return TokenError("expects comparison type");
   }
   std::string val = lexer_.GetStrVal();
-  auto status_or_result = StringToComparisonType(val);
+  auto status_or_result = ComparisonTypeToOrder(val);
   if (!status_or_result.ok()) {
     return TokenError(StrFormat("expects comparison type but sees: %s", val));
   }
@@ -9240,10 +9252,14 @@ HloComputation* HloParserImpl::CreateAsyncWrappedComputation(
   // will fail and crash. When there are not enough operands at creation time
   // (when late binding is used), we add dummy operands, and update the
   // async-wrapped computation later.
-  std::optional<int8_t> async_wrapped_opcode_arity =
-      HloOpcodeArity(async_wrapped_opcode);
-  uint64_t num_async_operands = std::max<uint64_t>(
-      async_wrapped_opcode_arity.value_or(0), operand_shapes.size());
+  int64_t min_arity = HloOpcodeArity(async_wrapped_opcode).value_or(0);
+  if (async_wrapped_opcode == HloOpcode::kDot ||
+      async_wrapped_opcode == HloOpcode::kDotGeneral ||
+      async_wrapped_opcode == HloOpcode::kConvolution) {
+    min_arity = 2;
+  }
+  uint64_t num_async_operands =
+      std::max<uint64_t>(min_arity, operand_shapes.size());
 
   HloComputation::Builder async_wrapped_builder("async_wrapped");
   async_wrapped_operands.reserve(num_async_operands);

@@ -265,6 +265,20 @@ TfLiteQuantization TfLiteQuantizationClone(const TfLiteQuantization& src) {
       dst_params->quantized_dimension = src_params->quantized_dimension;
       break;
     }
+    case kTfLiteBlockwiseQuantizationV2: {
+      dst.params = calloc(1, sizeof(TfLiteBlockwiseQuantizationV2));
+      if (!dst.params) return TfLiteQuantization();
+      const TfLiteBlockwiseQuantizationV2* const src_params =
+          reinterpret_cast<TfLiteBlockwiseQuantizationV2*>(src.params);
+      TfLiteBlockwiseQuantizationV2* const dst_params =
+          reinterpret_cast<TfLiteBlockwiseQuantizationV2*>(dst.params);
+      dst_params->blocksize = src_params->blocksize;
+      dst_params->scale = src_params->scale;
+      dst_params->zero_point = src_params->zero_point;
+      dst_params->quantized_dimension = src_params->quantized_dimension;
+      dst_params->block_shape = TfLiteIntArrayCopy(src_params->block_shape);
+      break;
+    }
     case kTfLiteMultiAxisQuantization: {
       dst.params = calloc(1, sizeof(TfLiteMultiAxisQuantization));
       if (!dst.params) return TfLiteQuantization();
@@ -385,6 +399,17 @@ void TfLiteQuantizationFree(TfLiteQuantization* quantization) {
     TfLiteBlockwiseQuantization* q_params =
         reinterpret_cast<TfLiteBlockwiseQuantization*>(quantization->params);
     free(q_params);
+  }
+  if (quantization->type == kTfLiteBlockwiseQuantizationV2) {
+    TfLiteBlockwiseQuantizationV2* q_params =
+        reinterpret_cast<TfLiteBlockwiseQuantizationV2*>(quantization->params);
+    if (q_params) {
+      if (q_params->block_shape) {
+        TfLiteIntArrayFree(q_params->block_shape);
+        q_params->block_shape = nullptr;
+      }
+      free(q_params);
+    }
   }
   if (quantization->type == kTfLiteMultiAxisQuantization) {
     TfLiteMultiAxisQuantization* q_params =
@@ -724,6 +749,22 @@ const char* TfLiteTypeGetName(TfLiteType type) {
       return "FLOAT8_E5M2";
   }
   return "Unknown type";
+}
+
+const char* TfLiteQuantizationTypeGetName(TfLiteQuantizationType type) {
+  switch (type) {
+    case kTfLiteNoQuantization:
+      return "None";
+    case kTfLiteAffineQuantization:
+      return "Affine";
+    case kTfLiteBlockwiseQuantization:
+      return "Blockwise";
+    case kTfLiteMultiAxisQuantization:
+      return "MultiAxis";
+    case kTfLiteBlockwiseQuantizationV2:
+      return "BlockwiseV2";
+  }
+  return "Unknown";
 }
 
 TfLiteDelegate TfLiteDelegateCreate() { return TfLiteDelegate{}; }

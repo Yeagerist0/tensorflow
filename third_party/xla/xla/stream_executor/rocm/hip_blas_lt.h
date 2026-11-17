@@ -110,14 +110,15 @@ class BlasLt : public gpu::BlasLt {
     RegularMatmulPlan(const BlasLt& blas_lt, MatmulDesc&& op_desc,
                       MatrixLayout&& a_desc, MatrixLayout&& b_desc,
                       MatrixLayout&& c_desc, MatrixLayout&& d_desc,
-                      bool must_swap_operands)
+                      bool must_swap_operands, bool has_d_scale)
         : blas_lt_(blas_lt),
           op_desc_(std::move(op_desc)),
           a_desc_(std::move(a_desc)),
           b_desc_(std::move(b_desc)),
           c_desc_(std::move(c_desc)),
           d_desc_(std::move(d_desc)),
-          must_swap_operands_(must_swap_operands) {}
+          must_swap_operands_(must_swap_operands),
+          has_d_scale_(has_d_scale) {}
 
     ~RegularMatmulPlan() override = default;
 
@@ -147,6 +148,7 @@ class BlasLt : public gpu::BlasLt {
     MatrixLayout d_desc_;
     alignas(16) std::array<uint8_t, kMaxScaleBytes> alpha_, beta_;
     bool must_swap_operands_;
+    bool has_d_scale_;
     mutable std::optional<hipblasLtMatmulAlgo_t> algorithm_;
     size_t workspace_size_ = 0;
   };  // class RegularMatmulPlan
@@ -178,12 +180,26 @@ class BlasLt : public gpu::BlasLt {
     }
 
    private:
+    // Transposes, data types and compute type shared by all GEMMs in the
+    // group, kept here rather than read back from hipblaslt_ext::GroupedGemm,
+    // whose getter returns a std::vector.
+    struct ProblemType {
+      hipblasOperation_t op_a;
+      hipblasOperation_t op_b;
+      hipDataType type_a;
+      hipDataType type_b;
+      hipDataType type_c;
+      hipDataType type_d;
+      hipblasComputeType_t compute_type;
+    };
+
     absl::Status DoInitialize(blas::ComputationType compute_type,
                               Epilogue epilogue);
 
     const BlasLt& blas_lt_;
     gpu::GroupedGemmConfig cfg_;
     Epilogue epilogue_ = Epilogue::kDefault;
+    ProblemType problem_type_{};
     std::unique_ptr<hipblaslt_ext::GroupedGemm> grouped_gemm_;
     mutable std::optional<hipblasLtMatmulAlgo_t> algorithm_;
     mutable bool algorithm_dirty_ = false;

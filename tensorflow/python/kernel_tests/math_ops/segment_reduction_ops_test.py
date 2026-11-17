@@ -176,6 +176,27 @@ class SegmentReductionOpTest(SegmentReductionHelper, parameterized.TestCase):
         result = math_ops.segment_sum(data=tf_x, segment_ids=indices).eval()
         self.assertAllEqual([[15, 18, 21, 24], [13, 14, 15, 16]], result)
 
+  @parameterized.product(
+      dtype=(
+          dtypes_lib.float16,
+          dtypes_lib.bfloat16,
+          dtypes_lib.float32,
+          dtypes_lib.float64,
+      ),
+      index_dtype=(dtypes_lib.int32, dtypes_lib.int64),
+  )
+  @test_util.run_gpu_only
+  @test_util.run_in_graph_and_eager_modes
+  def testSegmentIdsInvalidOnGpu(self, dtype, index_dtype):
+    data = constant_op.constant(
+        np.zeros([9, 4], dtype=dtype.as_numpy_dtype), dtype=dtype
+    )
+    segment_ids = constant_op.constant(
+        [32582, -21168624, 0, 0, 0, 0, 0, 32582, 0], dtype=index_dtype
+    )
+    result = math_ops.segment_sum(data=data, segment_ids=segment_ids)
+    self.evaluate(result)
+
   def testSegmentIdsGreaterThanZero(self):
     shape = [4, 4]
     for use_gpu in [True, False]:
@@ -341,15 +362,9 @@ class SegmentReductionOpTest(SegmentReductionHelper, parameterized.TestCase):
             )
             res_max = math_ops.segment_max(data_max, segment_ids)
 
-            if use_gpu:
-              # GPU sorted segment reductions use GpuAtomicMin/GpuAtomicMax
-              # which do not propagate NaNs (they prefer numeric values).
-              self.assertAllClose(self.evaluate(res_min)[0], 1.0)
-              self.assertAllClose(self.evaluate(res_max)[0], 3.0)
-            else:
-              # CPU propagates NaNs via Eigen::PropagateNaN.
-              self.assertTrue(np.isnan(self.evaluate(res_min)[0]))
-              self.assertTrue(np.isnan(self.evaluate(res_max)[0]))
+            # A segment containing a NaN propagates NaN, on both CPU and GPU.
+            self.assertTrue(np.isnan(self.evaluate(res_min)[0]))
+            self.assertTrue(np.isnan(self.evaluate(res_max)[0]))
 
             # Test 2D input NaN propagation
             data_2d = constant_op.constant(
@@ -361,17 +376,10 @@ class SegmentReductionOpTest(SegmentReductionHelper, parameterized.TestCase):
             res_2d_max = math_ops.segment_max(data_2d, segment_ids)
             evaluated_max = self.evaluate(res_2d_max)
 
-            if use_gpu:
-              # GPU does not propagate NaNs
-              self.assertAllClose(evaluated_min[0][0], 1.0)
-              self.assertAllClose(evaluated_min[0][1], 1.0)
-              self.assertAllClose(evaluated_max[0][0], 3.0)
-              self.assertAllClose(evaluated_max[0][1], 3.0)
-            else:
-              self.assertTrue(np.isnan(evaluated_min[0][0]))
-              self.assertAllClose(evaluated_min[0][1], 1.0)
-              self.assertTrue(np.isnan(evaluated_max[0][0]))
-              self.assertAllClose(evaluated_max[0][1], 3.0)
+            self.assertTrue(np.isnan(evaluated_min[0][0]))
+            self.assertAllClose(evaluated_min[0][1], 1.0)
+            self.assertTrue(np.isnan(evaluated_max[0][0]))
+            self.assertAllClose(evaluated_max[0][1], 3.0)
 
 
 class UnsortedSegmentTest(SegmentReductionHelper, parameterized.TestCase):
@@ -690,14 +698,9 @@ class UnsortedSegmentTest(SegmentReductionHelper, parameterized.TestCase):
                 data_max, segment_ids, num_segments=1
             )
 
-            if use_gpu:
-              # GPU segment reductions currently do not support NaN
-              # propagation due to hardware/atomic operation limitations.
-              self.assertAllClose(self.evaluate(res_min)[0], 1.0)
-              self.assertAllClose(self.evaluate(res_max)[0], 3.0)
-            else:
-              self.assertTrue(np.isnan(self.evaluate(res_min)[0]))
-              self.assertTrue(np.isnan(self.evaluate(res_max)[0]))
+            # A segment containing a NaN propagates NaN, on both CPU and GPU.
+            self.assertTrue(np.isnan(self.evaluate(res_min)[0]))
+            self.assertTrue(np.isnan(self.evaluate(res_max)[0]))
 
             # 2D input
             data_2d = constant_op.constant(
@@ -713,17 +716,10 @@ class UnsortedSegmentTest(SegmentReductionHelper, parameterized.TestCase):
             )
             evaluated_max = self.evaluate(res_2d_max)
 
-            if use_gpu:
-              # GPU does not propagate NaNs
-              self.assertAllClose(evaluated_min[0][0], 1.0)
-              self.assertAllClose(evaluated_min[0][1], 1.0)
-              self.assertAllClose(evaluated_max[0][0], 3.0)
-              self.assertAllClose(evaluated_max[0][1], 3.0)
-            else:
-              self.assertTrue(np.isnan(evaluated_min[0][0]))
-              self.assertAllClose(evaluated_min[0][1], 1.0)
-              self.assertTrue(np.isnan(evaluated_max[0][0]))
-              self.assertAllClose(evaluated_max[0][1], 3.0)
+            self.assertTrue(np.isnan(evaluated_min[0][0]))
+            self.assertAllClose(evaluated_min[0][1], 1.0)
+            self.assertTrue(np.isnan(evaluated_max[0][0]))
+            self.assertAllClose(evaluated_max[0][1], 3.0)
 
   def testNumSegmentsOverflow(self):
     """Regression test: an oversized num_segments raises InvalidArgumentError.

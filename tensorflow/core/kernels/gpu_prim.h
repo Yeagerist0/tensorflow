@@ -19,9 +19,9 @@ limitations under the License.
 
 #if GOOGLE_CUDA
 
-// Clang can't always unroll all loops, and it's not clear yet why.
-// Silence the warning for now to avoid build breaks with -Werror.
-#pragma clang diagnostic ignored "-Wpass-failed"
+// Clang may emit -Wpass-failed for CUB code during CUDA compilation.
+// Suppress it in the owning Bazel target's GPU copts instead of changing
+// diagnostic state in this public header.
 
 #include "cub/block/block_load.cuh"
 #include "cub/block/block_scan.cuh"
@@ -38,6 +38,7 @@ limitations under the License.
 #include "cub/iterator/transform_input_iterator.cuh"
 #else
 #include "cuda/ptx"
+#include "thrust/iterator/constant_iterator.h"
 #include "thrust/iterator/counting_iterator.h"
 #include "thrust/iterator/transform_iterator.h"
 #endif

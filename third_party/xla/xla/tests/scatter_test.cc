@@ -768,6 +768,39 @@ ENTRY main {
   RunTest(hlo_text, &operand, &scatter_indices, &updates);
 }
 
+TEST_F(ScatterTest, U8IndexWithBoundOutsideIndexType) {
+  // The valid index bound (299) does not fit into u8; index 200 must still
+  // be applied.
+  const std::string hlo_text = R"(
+HloModule U8IndexWithBoundOutsideIndexType
+
+add_s32 (lhs: s32[], rhs: s32[]) -> s32[] {
+  lhs = s32[] parameter(0)
+  rhs = s32[] parameter(1)
+  ROOT add = s32[] add(lhs, rhs)
+}
+
+ENTRY main {
+  operand = s32[300]{0} parameter(0)
+  indices = u8[1,1]{1,0} parameter(1)
+  updates = s32[1]{0} parameter(2)
+  ROOT scatter = s32[300]{0} scatter(operand, indices, updates),
+      to_apply=add_s32,
+      update_window_dims={},
+      inserted_window_dims={0},
+      scatter_dims_to_operand_dims={0},
+      index_vector_dim=1
+}
+)";
+  Literal operand =
+      LiteralUtil::CreateRandomLiteral<S32>(ShapeUtil::MakeShape(S32, {300}),
+                                            /*mean=*/500, /*stddev=*/100)
+          .value();
+  Literal scatter_indices = LiteralUtil::CreateR2<uint8_t>({{200}});
+  Literal updates = LiteralUtil::CreateR1<int32_t>({1000});
+  RunTest(hlo_text, &operand, &scatter_indices, &updates);
+}
+
 TEST_F(ScatterTest, NegativeIndex) {
   const std::string hlo_text = R"(
 HloModule BatchDynamicSlice
@@ -1083,6 +1116,51 @@ ENTRY main.2 {
       {{{1.0, 1.1}, {2.0, 2.1}}, {{3.0, 3.1}, {4.0, 4.1}}});
 
   RunTest(hlo_text, {&updates});
+}
+
+TEST_F(ScatterTest, AddScatterRepeatedParameterNotCombined) {
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule ScatterAddRepeatedParameter
+dp0 { p0 = s16[] parameter(0) p1 = s16[] parameter(1)
+      ROOT r = s16[] add(p0, p0) }
+dp1 { p0 = s16[] parameter(0) p1 = s16[] parameter(1)
+      ROOT r = s16[] add(p1, p1) }
+as16 { p0 = s16[] parameter(0) p1 = s16[] parameter(1)
+       ROOT r = s16[] add(p0, p1) }
+ENTRY main {
+  op1 = s16[8] parameter(0) ix1 = s32[2,1] parameter(1)
+  up1 = s16[2] parameter(2) op2 = s16[8] parameter(3)
+  ix2 = s32[2,1] parameter(4) up2 = s16[2] parameter(5)
+  s_lhs = s16[8] scatter(op1, ix1, up1), update_window_dims={}, index_vector_dim=1,
+      inserted_window_dims={0}, scatter_dims_to_operand_dims={0}, to_apply=dp0
+  out_lhs = s16[8] add(s_lhs, op2)
+  s_rhs = s16[8] scatter(op1, ix1, up1), update_window_dims={}, index_vector_dim=1,
+      inserted_window_dims={0}, scatter_dims_to_operand_dims={0}, to_apply=dp1
+  out_rhs = s16[8] add(op2, s_rhs)
+  s_cat0 = s16[8] scatter(op1, ix1, up1), update_window_dims={}, index_vector_dim=1,
+      inserted_window_dims={0}, scatter_dims_to_operand_dims={0}, to_apply=dp0
+  s_cat1 = s16[8] scatter(op2, ix2, up2), update_window_dims={}, index_vector_dim=1,
+      inserted_window_dims={0}, scatter_dims_to_operand_dims={0}, to_apply=as16
+  out_cat = s16[8] add(s_cat0, s_cat1)
+  s_chn0 = s16[8] scatter(op1, ix1, up1), update_window_dims={}, index_vector_dim=1,
+      inserted_window_dims={0}, scatter_dims_to_operand_dims={0},
+      unique_indices=true, to_apply=dp0
+  s_chn1 = s16[8] scatter(op2, ix1, up2), update_window_dims={}, index_vector_dim=1,
+      inserted_window_dims={0}, scatter_dims_to_operand_dims={0},
+      unique_indices=true, to_apply=as16
+  out_chn = s16[8] add(s_chn0, s_chn1)
+  ROOT out = (s16[8], s16[8], s16[8], s16[8]) tuple(
+      out_lhs, out_rhs, out_cat, out_chn)
+}
+)hlo";
+  Literal op1 = LiteralUtil::CreateR1<int16_t>({1, 2, 3, 4, 5, 6, 7, 8});
+  Literal idx1 = LiteralUtil::CreateR2<int32_t>({{1}, {2}});
+  Literal upd1 = LiteralUtil::CreateR1<int16_t>({5, 7});
+  Literal op2 =
+      LiteralUtil::CreateR1<int16_t>({10, 20, 30, 40, 50, 60, 70, 80});
+  Literal idx2 = LiteralUtil::CreateR2<int32_t>({{4}, {5}});
+  Literal upd2 = LiteralUtil::CreateR1<int16_t>({100, 200});
+  RunTest(kHloText, {&op1, &idx1, &upd1, &op2, &idx2, &upd2});
 }
 
 TEST_F(ScatterTest, EmptyIndexVector) {

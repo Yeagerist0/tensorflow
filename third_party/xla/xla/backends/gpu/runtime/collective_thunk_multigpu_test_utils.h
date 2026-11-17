@@ -32,6 +32,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/collective_thunk.h"
 #include "xla/backends/gpu/runtime/command_state.h"
 #include "xla/backends/gpu/runtime/thunk.h"
+#include "xla/backends/gpu/runtime/thunk_test_utils.h"
 #include "xla/future.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/device_assignment.h"
@@ -48,6 +49,9 @@ limitations under the License.
 
 namespace xla::gpu {
 
+inline constexpr int64_t kNumElements = 4;
+inline constexpr int64_t kFloatByteLength = sizeof(float) * kNumElements;
+
 struct CollectiveThunkMultiGpuTestState {
   int device_ordinal = 0;
   se::StreamExecutor* executor = nullptr;
@@ -61,6 +65,7 @@ struct CollectiveThunkMultiGpuTestState {
   ServiceExecutableRunOptions run_options;
   std::optional<CollectiveParams> collective_params;
   CollectiveCliques collective_cliques;
+  std::unique_ptr<TestThunkParams> thunk_params;
 
   CommandStateManager state_manager;
   std::unique_ptr<se::CommandBuffer> command_buffer;

@@ -24,6 +24,7 @@ include "mlir/Pass/PassBase.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/ViewLikeInterface.td"
 include "xla/mosaic/dialect/tpu/tpu.td"
 include "xla/mosaic/dialect/tpu/tpu_enums.td"
 include "xla/mosaic/dialect/tpu/tpu_types.td"
@@ -69,7 +70,6 @@ def TPU_TiledLayoutAttr
     ArrayRefParameter<"int64_t", "">:$tile_strides
   );
   let extraClassDeclaration = [{
-    static ::llvm::SmallVector<int64_t> getContiguousTileStrides(::llvm::ArrayRef<::xla::Tile> tiles, ::llvm::ArrayRef<int64_t> shape);
     static TiledLayoutAttr getContiguous(::mlir::MLIRContext* context, ::llvm::ArrayRef<::xla::Tile> tiles, ::llvm::ArrayRef<int64_t> shape);
 
     // Returns the number of trailing dimensions where tiles can be statically
@@ -83,23 +83,10 @@ def TPU_TiledLayoutAttr
       return getNumTrailingDimsWithContiguousTiles(shape) == getRank();
     }
 
-    // Returns the smallest tile that can be used to divide the first tile of
-    // `tiles` into contiguous subtiles.
-    // NOTE: For tiles (T1, T2, ..., Tn), let Ts be the unit subtile. Then,
-    //   (T1, T2, ..., Tn) is equivalent to (T1, Ts, T2, ..., Tn). Furthermore,
-    //   tiles (T2, ..., Tn) permute data within each Ts tile, but never across
-    //   Ts tiles.
-    static ::llvm::SmallVector<int64_t> getUnitSubtile(::llvm::ArrayRef<::xla::Tile> tiles);
-    ::llvm::SmallVector<int64_t> getUnitSubtile() const {
-      return getUnitSubtile(getTiles());
-    }
-
     int64_t getRank() const {
       return getTileStrides().size();
     }
-    int64_t getUntiledRank() const;
 
-    ::llvm::SmallVector<int64_t> getExpandedShape(::llvm::ArrayRef<int64_t> shape) const;
     ::llvm::SmallVector<int64_t> getExpandedStrides() const;
 
     // Returns true if any of the tile strides are dynamic.
@@ -124,6 +111,7 @@ def TPU_MemorySpaceAttr : AttrDef<TPU_Dialect, "MemorySpace"> {
         return get($_ctxt, value, std::nullopt);
     }]>
   ];
+  let genVerifyDecl = 1;
 }
 
 class TPU_Op<string mnemonic, list<Trait> traits = []> :
@@ -137,19 +125,19 @@ def TPU_AllReduceOp : TPU_Op<"all_reduce", [Pure]> {
   let arguments = (ins AnyVectorOfNonZeroRank:$input, I64Attr:$dim, TPU_ReductionKindAttr:$kind);
   let results = (outs AnyVectorOfNonZeroRank:$output);
   let assemblyFormat = [{
-    $input attr-dict `:` type($input) `->` type($output)
+    $input prop-dict attr-dict `:` type($input) `->` type($output)
   }];
   let hasVerifier = 1;
 }
 
-def TPU_ReduceIndexOp : TPU_Op<"reduce_index", [Pure]> {
+def TPU_ReduceIndexOp : TPU_Op<"reduce_index", [Pure, SameOperandsAndResultRank]> {
   let arguments = (ins
     AnyVectorOfNonZeroRank:$input,
     I32Attr:$axis,
     TPU_ReductionKindAttr:$kind
   );
   let results = (outs VectorOfNonZeroRankOf<[I16, I32]>:$output);
-  let assemblyFormat = [{ $input attr-dict `:` type($input) `->` type($output) }];
+  let assemblyFormat = [{ $input prop-dict attr-dict `:` type($input) `->` type($output) }];
   let hasVerifier = 1;
 }
 
@@ -199,7 +187,7 @@ def TPU_ReduceOp : TPU_Op<"reduce", [Pure, SameOperandsAndResultRank]> {
 //  mask   : Elementwise vector mask. The scan operation starts from the
 //           lowest-indexed non-masked vector element (all previous elements
 //           have undefined values). Not taken for I1 input vectors.
-def TPU_ScanOp : TPU_Op<"scan"> {
+def TPU_ScanOp : TPU_Op<"scan", [Pure]> {
   let arguments = (ins
     VectorOfNonZeroRankOf<[I1, I16, I32, BF16, F32]>:$input,
     TPU_ReductionKindAttr:$kind,
@@ -208,7 +196,7 @@ def TPU_ScanOp : TPU_Op<"scan"> {
   );
   let results = (outs VectorOfNonZeroRankOf<[I16, I32, BF16, F32]>:$output);
   let assemblyFormat = [{
-    $kind `,` $input (`masked` $mask^)? attr-dict `:` type($input) `,` type($mask) `->` type($output)
+    $kind `,` $input (`masked` $mask^)? prop-dict attr-dict `:` type($input) `,` type($mask) `->` type($output)
   }];
   let hasVerifier = 1;
 }
@@ -221,7 +209,7 @@ def TPU_SortOp : TPU_Op<"sort", [Pure]> {
     preserve their input order regardless of the sorting order. Masked-out keys
     and values are placed at the end of the output vectors. Integer keys are
     treated as unsigned. An output mask indicates which outputs correspond to
-    the valid inputs. 
+    the valid inputs.
   }];
   let arguments = (ins
     VectorOfNonZeroRankOf<[I32,F32]>:$keys,
@@ -235,7 +223,7 @@ def TPU_SortOp : TPU_Op<"sort", [Pure]> {
     VectorOfNonZeroRankOf<[I32,F32]>:$sorted_values
   );
   let assemblyFormat = [{
-    $keys `,` $values (`masked` $mask^)? attr-dict `:` functional-type(operands, results)
+    $keys `,` $values (`masked` $mask^)? prop-dict attr-dict `:` functional-type(operands, results)
   }];
   let hasVerifier = 1;
 }
@@ -252,7 +240,7 @@ def TPU_StoreOp : TPU_Op<"store", [DefaultMemWrite, AttrSizedOperandSegments]> {
   );
   let results = (outs);
   let assemblyFormat = [{
-    $base `[` $indices `]` `,` $valueToStore (`masked` $mask^)? `sublanes` $sublane_mask  (`sublane_stride` $sublane_stride^)? attr-dict `:` type($base) `,` type($valueToStore) `,` type($mask)
+    $base `[` $indices `]` `,` $valueToStore (`masked` $mask^)? `sublanes` $sublane_mask  (`sublane_stride` $sublane_stride^)? prop-dict attr-dict `:` type($base) `,` type($valueToStore) `,` type($mask)
   }];
 }
 
@@ -286,7 +274,7 @@ def TPU_VectorStoreOp :TPU_Op<"vector_store", [DefaultMemWrite, AttrSizedOperand
   );
   let results = (outs);
   let assemblyFormat = [{
-    $base `[` $indices `]` `,` $valueToStore (`masked` $mask^)? attr-dict `:` type($base) `,` type($valueToStore) `,` type($mask)
+    $base `[` $indices `]` `,` $valueToStore (`masked` $mask^)? prop-dict attr-dict `:` type($base) `,` type($valueToStore) `,` type($mask)
   }];
   let hasVerifier = 1;
   let builders = [
@@ -328,7 +316,7 @@ def TPU_CompressStoreVregOp : TPU_Op<"compress_store_vreg", [DefaultMemWrite]> {
   );
   let results = (outs);
   let assemblyFormat = [{
-    $base `[` $indices `]` `,` $valueToStore `,` $mask attr-dict `:` type($base) `,` type($valueToStore) `,` type($mask)
+    $base `[` $indices `]` `,` $valueToStore `,` $mask prop-dict attr-dict `:` type($base) `,` type($valueToStore) `,` type($mask)
   }];
   let hasVerifier = 1;
 }
@@ -372,7 +360,7 @@ def TPU_VectorCompressStoreOp : TPU_Op<"vector_compress_store", [DefaultMemWrite
   );
   let results = (outs);
   let assemblyFormat = [{
-    $base `[` $indices `]` `,` $valueToStore `,` $mask attr-dict `:` type($base) `,` type($valueToStore) `,` type($mask)
+    $base `[` $indices `]` `,` $valueToStore `,` $mask prop-dict attr-dict `:` type($base) `,` type($valueToStore) `,` type($mask)
   }];
   let hasVerifier = 1;
 }
@@ -451,7 +439,7 @@ def TPU_VectorExpandLoadOp : TPU_Op<"vector_expand_load", [DefaultMemRead]> {
   );
   let results = (outs AnyVectorOfNonZeroRank:$result);
   let assemblyFormat = [{
-    $base `[` $indices `]` `,` $mask attr-dict `:` type($base) `,` type($result) `,` type($mask)
+    $base `[` $indices `]` `,` $mask prop-dict attr-dict `:` type($base) `,` type($result) `,` type($mask)
   }];
   let hasVerifier = 1;
 }
@@ -478,7 +466,7 @@ def TPU_VectorLoadOp :TPU_Op<"vector_load", [DefaultMemRead, AttrSizedOperandSeg
   );
   let results = (outs AnyVectorOfNonZeroRank:$result);
   let assemblyFormat = [{
-    $base `[` $indices `]` (`masked` $mask^)? attr-dict `:` type($base) `,` type($result) `,` type($mask)
+    $base `[` $indices `]` (`masked` $mask^)? prop-dict attr-dict `:` type($base) `,` type($result) `,` type($mask)
   }];
   let hasVerifier = 1;
   let builders = [
@@ -494,10 +482,9 @@ def TPU_StridedLoadOp : TPU_Op<"strided_load", [DefaultMemRead]> {
   );
   let results = (outs AnyVectorOfNonZeroRank:$result);
   let assemblyFormat = [{
-    $base `[` $indices `]` attr-dict `:` type($base) `,` type($result)
+    $base `[` $indices `]` prop-dict attr-dict `:` type($base) `,` type($result)
   }];
   let hasVerifier = 1;
-  let hasFolder = 1;
 }
 
 def TPU_StridedStoreOp : TPU_Op<"strided_store", [DefaultMemWrite]> {
@@ -509,7 +496,7 @@ def TPU_StridedStoreOp : TPU_Op<"strided_store", [DefaultMemWrite]> {
   );
   let results = (outs);
   let assemblyFormat = [{
-    $base `[` $indices `]` `,` $valueToStore attr-dict `:` type($base) `,` type($valueToStore)
+    $base `[` $indices `]` `,` $valueToStore prop-dict attr-dict `:` type($base) `,` type($valueToStore)
   }];
   let hasVerifier = 1;
 }
@@ -524,10 +511,9 @@ def TPU_ShuffledLoadOp : TPU_Op<"shuffled_load", [DefaultMemRead]> {
   );
   let results = (outs TPU_Vreg:$result);
   let assemblyFormat = [{
-    $base `[` $indices `]` attr-dict `:` type($base) `,` type($result)
+    $base `[` $indices `]` prop-dict attr-dict `:` type($base) `,` type($result)
   }];
   let hasVerifier = 1;
-  let hasCanonicalizeMethod = 1;
 }
 
 // TODO: b/435258666 - Merge with tpu.vector_store_idx.
@@ -541,10 +527,9 @@ def TPU_ShuffledStoreOp : TPU_Op<"shuffled_store", [DefaultMemWrite]> {
   );
   let results = (outs);
   let assemblyFormat = [{
-    $base `[` $indices `]` `,` $valueToStore attr-dict `:` type($base) `,` type($valueToStore)
+    $base `[` $indices `]` `,` $valueToStore prop-dict attr-dict `:` type($base) `,` type($valueToStore)
   }];
   let hasVerifier = 1;
-  let hasCanonicalizeMethod = 1;
 }
 
 // tpu.vector_load_idx loads values from arbitrary locations in memory.
@@ -603,7 +588,7 @@ def TPU_VectorStoreIdxOp :TPU_Op<"vector_store_idx", [DefaultMemWrite, AttrSized
   );
   let results = (outs);
   let assemblyFormat = [{
-    $base `[` $indices `]` `,` $valueToStore (`masked` $mask^)? attr-dict `:` type($base) `[` type($indices) `]` `,` type($valueToStore) `,` type($mask)
+    $base `[` $indices `]` `,` $valueToStore (`masked` $mask^)? prop-dict attr-dict `:` type($base) `[` type($indices) `]` `,` type($valueToStore) `,` type($mask)
   }];
   let hasVerifier = 1;
 }
@@ -620,7 +605,7 @@ def TPU_DynamicRotateOp : TPU_Op<"dynamic_rotate", [Pure, AllTypesMatch<["value"
   );
   let results = (outs AnyVectorOfNonZeroRank:$result);
   let assemblyFormat = [{
-    $value `by` $amount `dim` $dimension attr-dict `:` type($value) `,` type($amount)  `->` type($result)
+    $value `by` $amount `dim` $dimension prop-dict attr-dict `:` type($value) `,` type($amount)  `->` type($result)
   }];
   let hasVerifier = 1;
 }
@@ -676,7 +661,7 @@ def TPU_IotaOp : TPU_Op<"iota", [Pure]> {
 
     Example:
     ```
-    tpu.iota {dimensions = array<i32: 2, 0>} : vector<4x3x2xi16>
+    tpu.iota <dimensions = [2, 0]> : vector<4x3x2xi16>
     ```
     This produces a vector with the following values:
     ```
@@ -688,7 +673,7 @@ def TPU_IotaOp : TPU_Op<"iota", [Pure]> {
   }];
   let arguments = (ins DenseI32ArrayAttr:$dimensions);
   let results = (outs VectorOfNonZeroRankOf<[AnyInteger, Index]>:$output);
-  let assemblyFormat = [{ attr-dict `:` type($output) }];
+  let assemblyFormat = [{ prop-dict attr-dict `:` type($output) }];
   let hasVerifier = 1;
 }
 
@@ -697,19 +682,6 @@ def TPU_ReshapeOp : TPU_Op<"reshape", [Pure]> {
   let results = (outs AnyVectorOfNonZeroRank:$result);
   let assemblyFormat = [{ $source attr-dict `:` type($source) `->` type($result) }];
   let hasVerifier = 1;
-  let hasFolder = 1;
-}
-
-// TODO(mvoz): deprecated - use concat. Canonicalization will do so automatically.
-// b/376295711
-def TPU_RepeatOp : TPU_Op<"repeat", [Pure]> {
-  let arguments = (ins
-    AnyVectorOfNonZeroRank:$source,
-    I32Attr:$dimension,
-    I32Attr:$times
-  );
-  let results = (outs AnyVectorOfNonZeroRank:$output);
-  let assemblyFormat = [{ $source `,` $dimension `x` $times attr-dict `:` type($source) `->` type($output) }];
 }
 
 def TPU_BroadcastInSublanesOp : TPU_Op<"broadcast_in_sublanes", [Pure]> {
@@ -775,9 +747,8 @@ def TPU_UnpackSubelementsOp : TPU_Op<"unpack_subelements", [Pure]> {
     DefaultValuedAttr<BoolAttr, "false">:$unsigned_integers
   );
   let results = (outs AnyVectorOfNonZeroRank:$output);
-  let assemblyFormat = [{ $source `,` $index attr-dict `:` type($source) `->` type($output) }];
+  let assemblyFormat = [{ $source `,` $index prop-dict attr-dict `:` type($source) `->` type($output) }];
   let hasVerifier = 1;
-  let hasCanonicalizeMethod = 1;
 }
 
 // unsigned_integers applies to the result type (for the source type the sign
@@ -849,11 +820,7 @@ def TPU_PackSubelementsOp : TPU_Op<"pack_subelements", [Pure, SameTypeOperands]>
     DefaultValuedOptionalAttr<BoolAttr, "false">:$unsigned_integers
   );
   let results = (outs TPU_Vreg:$output);
-  let assemblyFormat = [{ $sources attr-dict `:` type($sources) `->` type($output) }];
-  let builders = [
-    OpBuilder<(ins "::mlir::VectorType":$output_type, "::mlir::ArrayRef<::mlir::Value>":$padded_sources, "::mlir::tpu::PackFormat":$pack_format)>,
-    OpBuilder<(ins "::mlir::VectorType":$output_type, "::mlir::ArrayRef<::mlir::Value>":$padded_sources, "::mlir::tpu::PackFormat":$pack_format, "bool":$unsigned_integers)>,
-  ];
+  let assemblyFormat = [{ $sources prop-dict attr-dict `:` type($sources) `->` type($output) }];
   let hasVerifier = 1;
 }
 
@@ -878,7 +845,7 @@ def TPU_PackElementwiseOp : TPU_Op<"pack_elementwise", [Pure, SameTypeOperands, 
     TypeAttr:$target_type
   );
   let results = (outs VectorOfNonZeroRankOf<[AnyInteger]>:$output);
-  let assemblyFormat = [{ $sources attr-dict `:` type($sources) `->` type($output) }];
+  let assemblyFormat = [{ $sources prop-dict attr-dict `:` type($sources) `->` type($output) }];
   let hasVerifier = 1;
 }
 
@@ -908,7 +875,7 @@ def TPU_UnpackElementwiseOp : TPU_Op<"unpack_elementwise", [Pure, ElementwiseMap
     I32Attr:$index
   );
   let results = (outs VectorOfNonZeroRankOf<[F32, AnyInteger]>:$output);
-  let assemblyFormat = [{ $source `,` $index attr-dict `:` type($source) `->` type($output) }];
+  let assemblyFormat = [{ $source `,` $index prop-dict attr-dict `:` type($source) `->` type($output) }];
   let hasVerifier = 1;
 }
 
@@ -923,7 +890,7 @@ def TPU_PackMaskOp : TPU_Op<"pack_vmsk", [Pure, SameTypeOperands]> {
     DenseI32ArrayAttr:$positions
   );
   let results = (outs TPU_Vmask:$output);
-  let assemblyFormat = [{ $sources attr-dict `:` type($sources) `->` type($output) }];
+  let assemblyFormat = [{ $sources prop-dict attr-dict `:` type($sources) `->` type($output) }];
   let builders = [
     OpBuilder<(ins "::mlir::VectorType":$output_type, "::mlir::ArrayRef<::mlir::Value>":$padded_sources)>,
   ];
@@ -969,7 +936,6 @@ def TPU_DynamicGatherOp : TPU_Op<"dynamic_gather", [Pure, DeclareOpInterfaceMeth
     $source `[` $indices `]` `in` $dimensions attr-dict
     `:` type($source) `,` type($indices) `->` type($output)
   }];
-  let hasCanonicalizeMethod = 1;
   let hasVerifier = 1;
 }
 
@@ -981,8 +947,7 @@ def AnySignlessIntegerLike : AnyTypeOf<[AnySignlessInteger, VectorOfAnyRankOf<[A
 def TPU_FPToSIOp : TPU_Op<"fptosi", [Pure, ElementwiseMappable]> {
   let arguments = (ins AnyFloatLike:$in, TPU_RoundingModeEnum:$rounding_mode);
   let results = (outs AnySignlessIntegerLike:$output);
-  let assemblyFormat = [{ $in attr-dict `:` type($in) `->` type($output) }];
-  let hasCanonicalizeMethod = 1;
+  let assemblyFormat = [{ $in prop-dict attr-dict `:` type($in) `->` type($output) }];
 }
 
 // Internal operation. All arith.fptoui operations that change the bitwidth
@@ -990,7 +955,7 @@ def TPU_FPToSIOp : TPU_Op<"fptosi", [Pure, ElementwiseMappable]> {
 def TPU_FPToUIOp : TPU_Op<"fptoui", [Pure, ElementwiseMappable]> {
   let arguments = (ins AnyFloatLike:$in, TPU_RoundingModeEnum:$rounding_mode);
   let results = (outs AnySignlessIntegerLike:$output);
-  let assemblyFormat = [{ $in attr-dict `:` type($in) `->` type($output) }];
+  let assemblyFormat = [{ $in prop-dict attr-dict `:` type($in) `->` type($output) }];
 }
 
 // Internal operation. All arith.sitofp operations that change the bitwidth
@@ -998,7 +963,7 @@ def TPU_FPToUIOp : TPU_Op<"fptoui", [Pure, ElementwiseMappable]> {
 def TPU_SIToFPOp : TPU_Op<"sitofp", [Pure, ElementwiseMappable]> {
   let arguments = (ins AnySignlessIntegerLike:$in, TPU_RoundingModeEnum:$rounding_mode);
   let results = (outs AnyFloatLike:$output);
-  let assemblyFormat = [{ $in attr-dict `:` type($in) `->` type($output) }];
+  let assemblyFormat = [{ $in prop-dict attr-dict `:` type($in) `->` type($output) }];
 }
 
 // Internal operation. All arith.uitofp operations that change the bitwidth
@@ -1006,7 +971,7 @@ def TPU_SIToFPOp : TPU_Op<"sitofp", [Pure, ElementwiseMappable]> {
 def TPU_UIToFPOp : TPU_Op<"uitofp", [Pure, ElementwiseMappable]> {
   let arguments = (ins AnySignlessIntegerLike:$in, TPU_RoundingModeEnum:$rounding_mode);
   let results = (outs AnyFloatLike:$output);
-  let assemblyFormat = [{ $in attr-dict `:` type($in) `->` type($output) }];
+  let assemblyFormat = [{ $in prop-dict attr-dict `:` type($in) `->` type($output) }];
 }
 
 // Internal operation.
@@ -1014,7 +979,6 @@ def TPU_ExtFOp : TPU_Op<"extf", [Pure, ElementwiseMappable]> {
   let arguments = (ins AnyFloatLike:$in);
   let results = (outs AnyFloatLike:$out);
   let assemblyFormat = [{ $in attr-dict `:` type($in) `->` type($out) }];
-  let hasFolder = 1;
 }
 
 // Internal operation.
@@ -1024,8 +988,7 @@ def TPU_TruncFOp : TPU_Op<"truncf", [Pure, ElementwiseMappable]> {
     TPU_RoundingModeEnum:$rounding_mode
   );
   let results = (outs AnyFloatLike:$out);
-  let assemblyFormat = [{ $in attr-dict `:` type($in) `->` type($out) }];
-  let hasFolder = 1;
+  let assemblyFormat = [{ $in prop-dict attr-dict `:` type($in) `->` type($out) }];
 }
 
 // TODO(apaszke): Think hard about precision
@@ -1046,9 +1009,8 @@ def TPU_MatmulOp : TPU_Op<"matmul", [Pure]> {
   );
   let results = (outs AnyVectorOfNonZeroRank:$result);
   let assemblyFormat = [{
-    $lhs `,` $rhs `,` $acc attr-dict `:` type($lhs) `,` type($rhs) `,` type($acc) `->` type($result)
+    $lhs `,` $rhs `,` $acc prop-dict attr-dict `:` type($lhs) `,` type($rhs) `,` type($acc) `->` type($result)
   }];
-  let hasCanonicalizer = 1;
   let hasVerifier = 1;
 }
 
@@ -1091,7 +1053,7 @@ def TPU_ConvOp : TPU_Op<"conv", [Pure]> {
   );
   let results = (outs AnyVectorOfNonZeroRank:$result);
   let assemblyFormat = [{
-    $lhs `,` $rhs `,` $acc attr-dict `:` type($lhs) `,` type($rhs) `,` type($acc) `->` type($result)
+    $lhs `,` $rhs `,` $acc prop-dict attr-dict `:` type($lhs) `,` type($rhs) `,` type($acc) `->` type($result)
   }];
   let hasVerifier = 1;
 }
@@ -1105,7 +1067,7 @@ def TPU_MatmulPushRhsOp : TPU_Op<"matmul_push_rhs"> {
   );
   let results = (outs);
   let assemblyFormat = [{
-    $rhs attr-dict `:` type($rhs)
+    $rhs prop-dict attr-dict `:` type($rhs)
   }];
 }
 
@@ -1118,7 +1080,7 @@ def TPU_MatmulAccLhsOp : TPU_Op<"matmul_acc_lhs"> {
   );
   let results = (outs);
   let assemblyFormat = [{
-    $acc `,` $lhs attr-dict `:` type($lhs)
+    $acc `,` $lhs prop-dict attr-dict `:` type($lhs)
   }];
 }
 
@@ -1129,7 +1091,7 @@ def TPU_MatmulPopOp : TPU_Op<"matmul_pop"> {
   );
   let results = (outs VectorOfRank<[2]>:$result);
   let assemblyFormat = [{
-    $acc attr-dict `:` type($result)
+    $acc prop-dict attr-dict `:` type($result)
   }];
 }
 
@@ -1141,7 +1103,7 @@ def TPU_MatmulLhsFifoOp : TPU_Op<"matmul_lhs_fifo"> {
   );
   let results = (outs);
   let assemblyFormat = [{
-    $lhs attr-dict `:` type($lhs)
+    $lhs prop-dict attr-dict `:` type($lhs)
   }];
 }
 
@@ -1154,6 +1116,8 @@ def TPU_MatmulPopFifoOp : TPU_Op<"matmul_pop_fifo"> {
     $mxu_index attr-dict `:` type($result)
   }];
 }
+
+include "xla/mosaic/dialect/tpu/tpu_matmul_ops.td"
 
 def TPU_ConcatenateOp : TPU_Op<"concatenate", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let arguments = (ins
@@ -1178,7 +1142,6 @@ def TPU_BitcastVregOp : TPU_Op<"bitcast_vreg", [Pure]> {
   let arguments = (ins TPU_Vreg:$input);
   let results = (outs TPU_Vreg:$output);
   let assemblyFormat = [{ $input attr-dict `:` type($input) `->` type($output) }];
-  let hasFolder = 1;
 }
 
 def TPU_WeirdOp : TPU_Op<"weird", [Pure, ElementwiseMappable]> {
@@ -1204,7 +1167,7 @@ def TPU_ReciprocalOp : TPU_Op<"reciprocal", [Pure, SameOperandsAndResultType, El
     DefaultValuedAttr<BoolAttr, "true">:$full_range
   );
   let results = (outs AnyVectorOfNonZeroRank:$output);
-  let assemblyFormat = [{ $input attr-dict `:` type($input) `->` type($output) }];
+  let assemblyFormat = [{ $input prop-dict attr-dict `:` type($input) `->` type($output) }];
   let hasVerifier = 1;
 }
 
@@ -1236,7 +1199,7 @@ def TPU_StochasticConvertElementwiseOp : TPU_Op<"stochastic_convert_elementwise"
     TypeAttr:$dst_type
   );
   let results = (outs VectorOfNonZeroRankOf<[I32]>:$output);
-  let assemblyFormat = [{ $input `,` $random attr-dict `:` type($input) `,` type($random) `->` type($output) }];
+  let assemblyFormat = [{ $input `,` $random prop-dict attr-dict `:` type($input) `,` type($random) `->` type($output) }];
   let hasVerifier = 1;
 }
 
@@ -1256,10 +1219,8 @@ def TPU_ReducePrecisionOp : TPU_Op<"reduce_precision", [Pure, ElementwiseMappabl
   );
   let results = (outs VectorOfNonZeroRankOf<[F32, BF16]>:$output);
   let assemblyFormat = [{
-    $input attr-dict `:` type($input) `->` type($output)
+    $input prop-dict attr-dict `:` type($input) `->` type($output)
   }];
-
-  let hasFolder = 1;
 }
 
 def TPU_RollVectorsOp : TPU_Op<"roll_vectors", [Pure]> {
@@ -1273,7 +1234,6 @@ def TPU_RollVectorsOp : TPU_Op<"roll_vectors", [Pure]> {
 def TPU_UnrollVectorsOp : TPU_Op<"unroll_vectors", [Pure]> {
   let arguments = (ins AnyVectorOfAnyRank:$input);
   let results = (outs Variadic<AnyVectorOfAnyRank>:$output);
-  let hasCanonicalizeMethod = 1;
   let assemblyFormat = [{
     $input attr-dict `:` type($input) `->` type($output)
   }];
@@ -1350,7 +1310,7 @@ def TPU_AssumeMultipleOp : TPU_Op<"assume_multiple", [Pure, SameOperandsAndResul
   let hasVerifier = 1;
 }
 
-def TPU_MemRefSliceOp : TPU_Op<"memref_slice", [Pure, AttrSizedOperandSegments]> {
+def TPU_MemRefSliceOp : TPU_Op<"memref_slice", [Pure, AttrSizedOperandSegments, ViewLikeOpInterface]> {
   let arguments = (ins
     AnyMemRef:$mem_ref,
     Variadic<I32>:$base_idx,
@@ -1362,70 +1322,121 @@ def TPU_MemRefSliceOp : TPU_Op<"memref_slice", [Pure, AttrSizedOperandSegments]>
     attr-dict `:` type($mem_ref) `->` type($result)
   }];
   let extraClassDeclaration = [{
-    // Returns a message string on error, and nullopt on success.
-    std::optional<std::string> verifyOffsetAndSizeTileAlignment(
-        std::array<int64_t, 2> tc_target_shape,
-        MemRefType source_type_override = nullptr);
-
-    // Given a source shape size, a slice shape size, a source tile size, a
-    // result tile size and optionally a slice offset, the below functions
-    // returns a tri-state boolean (nullopt means "unknown") indicating whether
-    // the result tiles of the slice stride across or within the source tiles.
-    // The result tile should divide the source tile and the offset, if
-    // provided, should be divisible by the result tile size.
-    static std::optional<bool> sliceStridesAcrossSourceTiles(
-        int64_t source_size, int64_t slice_size, int64_t source_tile_size,
-        int64_t result_tile_size, Value offset);
-    static std::optional<bool> sliceStridesWithinSourceTiles(
-        int64_t source_size, int64_t slice_size, int64_t source_tile_size,
-        int64_t result_tile_size, Value offset);
+    // ViewLikeOpInterface.
+    ::mlir::Value getViewSource() { return getMemRef(); }
   }];
   let hasVerifier = 1;
-  let hasCanonicalizer = 1;
-  let hasFolder = 1;
 }
 
-def TPU_MemRefSqueezeOp : TPU_Op<"memref_squeeze", [Pure]> {
+def TPU_SharedMemRefSliceOp : TPU_Op<"shared_memref_slice", [Pure, ViewLikeOpInterface]> {
+  let summary = "Slices a shared VMEM memref to a subcore-local VMEM memref.";
+  let description = [{
+    Extracts a subcore-local VMEM slice from a shared VMEM memref by dividing
+    the minor dimension across `num_subcores`.
+
+    To align with SparseCore physical VMEM striping, each subcore's minor
+    dimension slice (`result_shape[-1] = input_shape[-1] / num_subcores`) must
+    span exactly one physical VMEM stripe (`stripe_words`, e.g. 8 words / 32
+    bytes on TPU v7x).
+      - With >1D tiling (which requires a `(packing, 1)` sub-tile when
+        `packing > 1`), each minor index spans a full word, so
+        `result_shape[-1] == stripe_words`.
+      - With 1D tiling, each word holds `packing` elements along the minor
+        dimension, so `result_shape[-1] == stripe_words * packing`
+        (`stripe_bytes / element_bytes`).
+
+    Examples of valid shapes/layouts on a target with 16 subcores, 4B words, and
+    8-word stripes (e.g. TPU v7x):
+      - `8x128xbf16, #tpu.tiled<(8,128)(2,1),[1,1]>` (`result_shape[-1] = 8`)
+      - `8x256xbf16, #tpu.tiled<(16),[16,1]>` (`result_shape[-1] = 16`)
+      - `8x128xi32, #tpu.tiled<(8,128),[1,1]>` (`result_shape[-1] = 8`)
+      - `8x128xi32, #tpu.tiled<(8),[16,1]>` (`result_shape[-1] = 8`)
+  }];
+  let arguments = (ins
+    AnyMemRef:$mem_ref
+  );
+  let results = (outs AnyMemRef:$result);
+  let assemblyFormat = [{
+    $mem_ref attr-dict `:` type($mem_ref) `->` type($result)
+  }];
+  let extraClassDeclaration = [{
+    // ViewLikeOpInterface.
+    ::mlir::Value getViewSource() { return getMemRef(); }
+  }];
+  let hasVerifier = 1;
+}
+
+def TPU_MemRefSqueezeOp : TPU_Op<"memref_squeeze", [Pure, ViewLikeOpInterface]> {
   let arguments = (ins AnyMemRef:$input);
   let results = (outs AnyMemRef:$result);
   let assemblyFormat = [{
     $input attr-dict `:` type($input) `->` type($result)
   }];
   let extraClassDeclaration = [{
-    mlir::InFlightDiagnostic verifyTiling();
+    // ViewLikeOpInterface.
+    ::mlir::Value getViewSource() { return getInput(); }
   }];
   let hasVerifier = 1;
-  let hasCanonicalizer = 1;
 }
 
-def TPU_MemRefReshapeOp : TPU_Op<"memref_reshape", [Pure]> {
+def TPU_MemRefReshapeOp : TPU_Op<"memref_reshape", [Pure, ViewLikeOpInterface]> {
   let arguments = (ins AnyMemRef:$input);
   let results = (outs AnyMemRef:$result);
   let assemblyFormat = [{
     $input attr-dict `:` type($input) `->` type($result)
   }];
   let extraClassDeclaration = [{
-    static ::mlir::FailureOr<::mlir::MemRefLayoutAttrInterface> inferResultLayout(
-        ::mlir::MemRefType input_type, ::mlir::ArrayRef<int64_t> result_shape,
-        ::mlir::function_ref<::mlir::InFlightDiagnostic()> emit_error);
+    // ViewLikeOpInterface.
+    ::mlir::Value getViewSource() { return getInput(); }
   }];
   let hasVerifier = 1;
 }
 
-def TPU_MemRefBitcastOp : TPU_Op<"memref_bitcast", [Pure]> {
+def TPU_MemRefPadOp : TPU_Op<"memref_pad", [Pure, ViewLikeOpInterface]> {
+  let summary = "Pads a memref's logical shape within its physical tile bounds.";
+  let description = [{
+    Pads the logical dimensions of a memref up to (at most) the tile-aligned
+    bounds of its underlying `TiledLayoutAttr` without modifying physical
+    memory or layout.
+
+    For each dimension `i` with input size `in_dim`, result size `res_dim`, and
+    first-tile size `tile_size` (`1` for untiled leading dimensions),
+    `in_dim <= res_dim <= alignTo(in_dim, tile_size)` must hold. Because the
+    padded region lies within the already-allocated physical tiles, this
+    operation is a zero-cost metadata view in lowering. Reading from the padded
+    region yields undefined values.
+
+    This operation is also allowed in user programs before tiling is inferred
+    (when the memref has an identity layout), in which case the compiler will
+    reject the program during tiling propagation if the op requests more
+    padding than is guaranteed by the inferred tiling.
+  }];
   let arguments = (ins AnyMemRef:$input);
   let results = (outs AnyMemRef:$result);
   let assemblyFormat = [{
     $input attr-dict `:` type($input) `->` type($result)
   }];
   let extraClassDeclaration = [{
-    mlir::InFlightDiagnostic verifyTiling();
+    // ViewLikeOpInterface.
+    ::mlir::Value getViewSource() { return getInput(); }
   }];
   let hasVerifier = 1;
-  let hasCanonicalizeMethod = 1;
 }
 
-def TPU_ReinterpretCastOp : TPU_Op<"reinterpret_cast", [Pure, AttrSizedOperandSegments]> {
+def TPU_MemRefBitcastOp : TPU_Op<"memref_bitcast", [Pure, ViewLikeOpInterface]> {
+  let arguments = (ins AnyMemRef:$input);
+  let results = (outs AnyMemRef:$result);
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input) `->` type($result)
+  }];
+  let extraClassDeclaration = [{
+    // ViewLikeOpInterface.
+    ::mlir::Value getViewSource() { return getInput(); }
+  }];
+  let hasVerifier = 1;
+}
+
+def TPU_ReinterpretCastOp : TPU_Op<"reinterpret_cast", [Pure, AttrSizedOperandSegments, ViewLikeOpInterface]> {
   let arguments = (ins
     AnyMemRef:$input,
     // Dynamic offset shifts the memref pointer by the specified number of
@@ -1440,10 +1451,10 @@ def TPU_ReinterpretCastOp : TPU_Op<"reinterpret_cast", [Pure, AttrSizedOperandSe
   let assemblyFormat = [{
     $input ($dynamic_offset^)? (`<` $dynamic_sizes^ `>`)? (`[` $dynamic_strides^ `]`)? attr-dict `:` type($input) `->` type($result)
   }];
-  let skipDefaultBuilders = 1;
-  let builders = [
-    OpBuilder<(ins "::mlir::Type":$result_type, "::mlir::Value":$input, CArg<"::mlir::Value", "nullptr">:$dynamic_offset, CArg<"::mlir::ValueRange", "{}">:$dynamic_sizes, CArg<"::mlir::ValueRange", "{}">:$dynamic_strides)>
-  ];
+  let extraClassDeclaration = [{
+    // ViewLikeOpInterface.
+    ::mlir::Value getViewSource() { return getInput(); }
+  }];
   let hasVerifier = 1;
 }
 
@@ -1455,7 +1466,7 @@ def TPU_AssumeLayoutOp : TPU_Op<"assume_layout", [Pure]> {
   }];
 }
 
-def TPU_EraseLayoutOp : TPU_Op<"erase_memref_layout", [Pure]> {
+def TPU_EraseLayoutOp : TPU_Op<"erase_memref_layout", [Pure, SameOperandsAndResultShape, SameOperandsAndResultElementType, ViewLikeOpInterface]> {
   let description = [{
     Erases the layout attribute and, optionally, the memory space from a memref.
     The resulting memref is otherwise identical to the input.
@@ -1472,11 +1483,14 @@ def TPU_EraseLayoutOp : TPU_Op<"erase_memref_layout", [Pure]> {
   let assemblyFormat = [{
     $operand attr-dict `:` type($operand) `->` type($result)
   }];
-  let hasFolder = 1;
+  let extraClassDeclaration = [{
+    // ViewLikeOpInterface.
+    ::mlir::Value getViewSource() { return getOperand(); }
+  }];
   let hasVerifier = 1;
 }
 
-def TPU_AnnotateOp : TPU_Op<"annotate", [Pure, SameOperandsAndResultType]> {
+def TPU_AnnotateOp : TPU_Op<"annotate", [Pure, SameOperandsAndResultType, ViewLikeOpInterface]> {
   let summary = "Annotates a memref with memory annotations.";
   let arguments = (ins
     AnyMemRef:$operand,
@@ -1487,7 +1501,11 @@ def TPU_AnnotateOp : TPU_Op<"annotate", [Pure, SameOperandsAndResultType]> {
   );
   let results = (outs AnyMemRef:$result);
   let assemblyFormat = [{
-    $operand attr-dict `:` type($operand)
+    $operand prop-dict attr-dict `:` type($operand)
+  }];
+  let extraClassDeclaration = [{
+    // ViewLikeOpInterface.
+    ::mlir::Value getViewSource() { return getOperand(); }
   }];
   let hasVerifier = 1;
 }
@@ -1562,9 +1580,6 @@ let assemblyFormat = [{
     $semaphore `,` $amount (`device_id` $device_id^)? (`core_id` $core_id^)? (`subcore_id` $subcore_id^)? attr-dict `:` type($semaphore)
   }];
   let hasVerifier = 1;
-  let extraClassDeclaration = [{
-    mlir::tpu::CoreType getTargetCoreType();
-  }];
   let builders = [
     // A backward-compatible builder that sets `subcore_id` to nullptr.
     OpBuilder<(ins "Value":$semaphore, "Value":$amount, "Value":$device_id, "Value":$core_id)>,
@@ -1626,26 +1641,13 @@ def TPU_EnqueueDMAOp : TPU_Op<"enqueue_dma", [AttrSizedOperandSegments]> {
     (`device_id` `(` $device_id^ `)`)?
     (`core_id` `(` $core_id^ `)`)?
     (`subcore_id` `(` $subcore_id^ `)`)?
-    attr-dict
+    prop-dict attr-dict
   }];
   let hasVerifier = 1;
-  let extraClassDeclaration = [{
-    mlir::tpu::CoreType getTargetCoreType();
-  }];
   let builders = [
     // A backward-compatible builder that sets `subcore_id` to nullptr.
     OpBuilder<(ins "Value":$source, "Value":$source_semaphore, "Value":$target, "Value":$target_semaphore, "Value":$device_id, "Value":$core_id, CArg<"uint32_t", "0">:$priority, CArg<"bool", "false">:$strict_ordering)>,
   ];
-}
-
-// A base class for all ops that need to differentiate between gather and
-// scatter.
-class IndirectDMAOp {
-  code extraBaseClassDeclaration = [{
-    // Return true if this op performs a gather. Returns false if it performs a
-    // scatter.
-    FailureOr<bool> isGather();
-  }];
 }
 
 // tpu.enqueue_indirect_dma copies data between HBM and VMEM, or between
@@ -1673,7 +1675,7 @@ class IndirectDMAOp {
 // add             : If true, add source values to target values. Otherwise, overwrite.
 // offset_filter   : If set, don't write values at offsets whose value is equal to
 //                   the filter value.
-def TPU_EnqueueIndirectDMAOp : TPU_Op<"enqueue_indirect_dma">, IndirectDMAOp {
+def TPU_EnqueueIndirectDMAOp : TPU_Op<"enqueue_indirect_dma"> {
   let arguments = (ins
     AnyMemRef:$source,
     AnyMemRef:$target,
@@ -1688,10 +1690,9 @@ def TPU_EnqueueIndirectDMAOp : TPU_Op<"enqueue_indirect_dma">, IndirectDMAOp {
     `offsets` `(` $offsets `:` type($offsets) `)`
     (`offset_filter` `(` $offset_filter^ `)`)?
     `semaphore` `(` $semaphore `:` type($semaphore) `)`
-    attr-dict
+    prop-dict attr-dict
   }];
   let hasVerifier = 1;
-  let extraClassDeclaration = extraBaseClassDeclaration;
 }
 
 // tpu.wait_dma2 waits for a DMA to complete.
@@ -1713,7 +1714,7 @@ def TPU_WaitDMA2Op : TPU_Op<"wait_dma2", [AttrSizedOperandSegments]> {
     `dst` `(` $dst `:` type($dst) `)`
     (`device_id` `(` $device_id^ `)`)?
     (`core_id` `(` $core_id^ `)`)?
-    attr-dict
+    prop-dict attr-dict
   }];
   let hasVerifier = 1;
   // A backward-compatible builder that sets `device_id` and `core_id` to nullptr.
@@ -1744,7 +1745,7 @@ def TPU_WaitDMAOp : TPU_Op<"wait_dma", [AttrSizedOperandSegments]> {
     (`device_id` `(` $device_id^ `)`)?
     (`core_id` `(` $core_id^ `)`)?
     (`subcore_id` `(` $subcore_id^ `)`)?
-    attr-dict
+    prop-dict attr-dict
   }];
   let hasVerifier = 1;
 }
@@ -1755,7 +1756,7 @@ def TPU_WaitDMAOp : TPU_Op<"wait_dma", [AttrSizedOperandSegments]> {
 // destination memref in a gather, and the size of the source memref in a
 // scatter. The op differentiates between gather and scatter based on the memory
 // spaces of the source and destination memrefs.
-def TPU_WaitIndirectDMAOp : TPU_Op<"wait_indirect_dma">, IndirectDMAOp {
+def TPU_WaitIndirectDMAOp : TPU_Op<"wait_indirect_dma"> {
   let arguments = (ins
     MemRefOf<[TPU_DMASemaphoreType]>:$semaphore,
     AnyMemRef:$src,
@@ -1768,7 +1769,6 @@ def TPU_WaitIndirectDMAOp : TPU_Op<"wait_indirect_dma">, IndirectDMAOp {
     attr-dict
   }];
   let hasVerifier = 1;
-  let extraClassDeclaration = extraBaseClassDeclaration;
 }
 
 def TPU_RegionOp : TPU_Op<"region", [RecursiveMemoryEffects, SingleBlockImplicitTerminator<"tpu::YieldOp">]> {
@@ -1831,6 +1831,25 @@ def TPU_DelayOp : TPU_Op<"delay"> {
   let assemblyFormat = [{ $nanos attr-dict }];
 }
 
+def TPU_RequestPStateOp : TPU_Op<"request_p_state"> {
+  let summary = "Requests a TensorCore P-state transition.";
+  let description = [{
+    Requests a transition to the given TensorCore P-state, which controls the
+    TensorCore frequency; other subsystems may adjust their frequencies to match
+    the TensorCore. The transition is not immediate and is best-effort: the
+    hardware or firmware may ignore or clamp the request due to rate-limiting,
+    power, or thermal constraints.
+
+    The `p_state` attribute specifies the target P-state index and must be
+    non-negative. Supported on TPU7x+.
+
+    TODO(b/581416218): Link to the documentation once it is available.
+  }];
+  let arguments = (ins ConfinedAttr<I32Attr, [IntNonNegative]>:$p_state);
+  let results = (outs);
+  let assemblyFormat = [{ $p_state attr-dict }];
+}
+
 // Expands the granularity of mask to subelements.
 def TPU_MaskCastOp : TPU_Op<"mask_cast", [Pure]> {
   let description = [{
@@ -1871,7 +1890,7 @@ def TPU_PRNGRandomBitsOp : TPU_Op<"prng_random_bits"> {
   let results = (outs AnyVectorOfNonZeroRank:$output);
 }
 
-def TPU_SublaneShuffleOp : TPU_Op<"sublane_shuffle", [SameOperandsAndResultType]> {
+def TPU_SublaneShuffleOp : TPU_Op<"sublane_shuffle", [Pure, SameOperandsAndResultType]> {
   // This op takes 2 physical vregs and a pattern, applies the pattern,
   // and returns the result as 1 vreg.
   //
@@ -1921,7 +1940,6 @@ def TPU_TransposeOp : TPU_Op<"transpose", [Pure]> {
     }
   }];
   let hasVerifier = 1;
-  let hasFolder = 1;
 }
 
 def TPU_LogOp : TPU_Op<"log"> {
@@ -1931,7 +1949,7 @@ def TPU_LogOp : TPU_Op<"log"> {
     DefaultValuedAttr<BoolAttr, "false">:$formatted
   );
   let results = (outs);
-  let assemblyFormat = [{ $tag attr-dict (`:`  `[` $inputs^ `]` `:` type($inputs))? }];
+  let assemblyFormat = [{ $tag prop-dict attr-dict (`:`  `[` $inputs^ `]` `:` type($inputs))? }];
   let hasVerifier = 1;
 }
 
@@ -1942,7 +1960,7 @@ def TPU_LogBufferOp : TPU_Op<"log_buffer"> {
     StrAttr:$tag
   );
   let results = (outs);
-  let assemblyFormat = [{ $tag attr-dict `:` $input `:` type($input) }];
+  let assemblyFormat = [{ $tag prop-dict attr-dict `:` $input `:` type($input) }];
   let hasVerifier = 1;
 }
 
@@ -1999,6 +2017,27 @@ def TPU_TileSizeOp : TPU_Op<"tile_size", [Pure]> {
 
   let assemblyFormat = [{
     attr-dict $source `,` $index `:` type($source)
+  }];
+
+  let hasVerifier = 1;
+}
+
+def TPU_MemRefMemorySpaceIsOp : TPU_Op<"memref_memory_space_is", [Pure]> {
+  let summary = "Check if a memref resides in the given memory space.";
+  let description = [{
+    Returns true if `source` is in `memory_space`. If `memory_space` has no
+    core type, the core type of `source` is ignored.
+
+    The result is resolved at compile time, once the memory space of `source`
+    is fully known: `any` is specialized, and a missing memory space or core
+    type is filled in from the enclosing function's `tpu.core_type`.
+  }];
+
+  let arguments = (ins AnyMemRef:$source, TPU_MemorySpaceAttr:$memory_space);
+  let results = (outs I1:$result);
+
+  let assemblyFormat = [{
+    $source `,` $memory_space attr-dict `:` type($source)
   }];
 
   let hasVerifier = 1;

@@ -30,9 +30,10 @@ def TPU_Dialect : Dialect {
 
     static std::optional<CoreType> GetCoreTypeAttr(Operation *op);
   }];
-  let hasConstantMaterializer = 1;
-  let hasCanonicalizer = 1;
   let hasOperationAttrVerify = 1;
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+  ];
 }
 
 class TPU_Attr<string name, string mnemonic_, list<Trait> traits = []>

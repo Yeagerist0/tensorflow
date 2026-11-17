@@ -374,20 +374,23 @@ TfLiteStatus InterpreterBuilder::ParseNodes(
       if (op->custom_options()) {
         init_data = reinterpret_cast<const char*>(op->custom_options()->data());
         init_data_size = op->custom_options()->size();
-      } else if (op->large_custom_options_offset() > 1 && allocation_) {
-        if (op->large_custom_options_offset() +
-                op->large_custom_options_size() >
-            allocation_->bytes()) {
-          TF_LITE_REPORT_ERROR(
-              error_reporter_,
-              "Custom Option Offset for opcode_index %d is out of bound\n",
-              index);
-          return kTfLiteError;
+      } else if (allocation_) {
+        const uint64_t offset = op->large_custom_options_offset();
+        if (offset > 1) {
+          const size_t alloc_bytes = allocation_->bytes();
+          const uint64_t size = op->large_custom_options_size();
+          if (offset > alloc_bytes || size > alloc_bytes - offset) {
+            TF_LITE_REPORT_ERROR(
+                error_reporter_,
+                "Custom Option Offset for opcode_index %d is out of bound\n",
+                index);
+            return kTfLiteError;
+          }
+          // If the custom op is storing payloads outside of flatbuffers
+          init_data =
+              reinterpret_cast<const char*>(allocation_->base()) + offset;
+          init_data_size = size;
         }
-        // If the custom op is storing payloads outside of flatbuffers
-        init_data = reinterpret_cast<const char*>(allocation_->base()) +
-                    op->large_custom_options_offset();
-        init_data_size = op->large_custom_options_size();
       }
     } else {
       MallocDataAllocator malloc_allocator;
@@ -506,16 +509,67 @@ TfLiteStatus InterpreterBuilder::ParseQuantization(
                            "Blockwise quantization details are missing.");
       return kTfLiteError;
     }
-    quantization->type = kTfLiteBlockwiseQuantization;
-    auto* blockwise_quantization =
+    // `block_shape` supersedes `block_size`. It is only meaningful if it has
+    // exactly one entry per dimension of the tensor, so reject anything else
+    // rather than silently falling back to `block_size`, which would produce
+    // wrong values.
+    const auto* block_shape = src_quant->block_shape();
+    if (block_shape && !block_shape->empty()) {
+      if (!dims.empty() &&
+          static_cast<size_t>(block_shape->size()) != dims.size()) {
+        TF_LITE_REPORT_ERROR(
+            error_reporter_,
+            "BlockwiseQuantization block_shape must have one entry per "
+            "dimension. Expected %d entries, got %d.",
+            static_cast<int>(dims.size()), block_shape->size());
+        return kTfLiteError;
+      }
+      for (int i = 0; i < block_shape->size(); ++i) {
+        if (block_shape->Get(i) <= 0) {
+          TF_LITE_REPORT_ERROR(error_reporter_,
+                               "BlockwiseQuantization block_shape entries must "
+                               "be positive. Value %d at index %d is invalid.",
+                               block_shape->Get(i), i);
+          return kTfLiteError;
+        }
+      }
+      auto* blockwise_quantization_v2 =
+          reinterpret_cast<TfLiteBlockwiseQuantizationV2*>(
+              malloc(sizeof(TfLiteBlockwiseQuantizationV2)));
+      if (!blockwise_quantization_v2) {
+        return kTfLiteError;
+      }
+      blockwise_quantization_v2->scale = src_quant->scales();
+      blockwise_quantization_v2->zero_point = src_quant->zero_points();
+      blockwise_quantization_v2->quantized_dimension =
+          src_quantization->quantized_dimension();
+      blockwise_quantization_v2->blocksize = src_quant->block_size();
+      blockwise_quantization_v2->block_shape =
+          TfLiteIntArrayCreate(static_cast<int>(block_shape->size()));
+      if (!blockwise_quantization_v2->block_shape) {
+        free(blockwise_quantization_v2);
+        return kTfLiteError;
+      }
+      for (int i = 0; i < block_shape->size(); ++i) {
+        blockwise_quantization_v2->block_shape->data[i] = block_shape->Get(i);
+      }
+      quantization->type = kTfLiteBlockwiseQuantizationV2;
+      quantization->params = reinterpret_cast<void*>(blockwise_quantization_v2);
+      return kTfLiteOk;
+    }
+    auto* blockwise_quantization_v1 =
         reinterpret_cast<TfLiteBlockwiseQuantization*>(
             malloc(sizeof(TfLiteBlockwiseQuantization)));
-    blockwise_quantization->scale = src_quant->scales();
-    blockwise_quantization->zero_point = src_quant->zero_points();
-    blockwise_quantization->quantized_dimension =
+    if (!blockwise_quantization_v1) {
+      return kTfLiteError;
+    }
+    blockwise_quantization_v1->scale = src_quant->scales();
+    blockwise_quantization_v1->zero_point = src_quant->zero_points();
+    blockwise_quantization_v1->quantized_dimension =
         src_quantization->quantized_dimension();
-    blockwise_quantization->blocksize = src_quant->block_size();
-    quantization->params = reinterpret_cast<void*>(blockwise_quantization);
+    blockwise_quantization_v1->blocksize = src_quant->block_size();
+    quantization->type = kTfLiteBlockwiseQuantization;
+    quantization->params = reinterpret_cast<void*>(blockwise_quantization_v1);
     return kTfLiteOk;
   }
   if (!src_quantization->scale() || src_quantization->scale()->empty()) {
@@ -760,14 +814,16 @@ TfLiteStatus InterpreterBuilder::ParseTensors(
           *buffer_data = reinterpret_cast<const char*>(array->data());
           return kTfLiteOk;
         } else if (offset > 1 && allocation_) {
-          if (offset + buffer->size() > allocation_->bytes()) {
+          const size_t alloc_bytes = allocation_->bytes();
+          const uint64_t size = buffer->size();
+          if (offset > alloc_bytes || size > alloc_bytes - offset) {
             TF_LITE_REPORT_ERROR(
                 error_reporter_,
                 "Constant buffer %d specified an out of range offset.\n",
                 tensor->buffer());
             return kTfLiteError;
           }
-          *buffer_size = buffer->size();
+          *buffer_size = size;
           *buffer_data =
               reinterpret_cast<const char*>(allocation_->base()) + offset;
           return kTfLiteOk;
@@ -776,7 +832,7 @@ TfLiteStatus InterpreterBuilder::ParseTensors(
       return kTfLiteOk;
     };
     size_t buffer_size = 0;
-    const char* buffer_ptr;
+    const char* buffer_ptr = nullptr;
     TF_LITE_ENSURE_STATUS(get_readonly_data(&buffer_ptr, &buffer_size));
 
     const auto* src_quantization = tensor->quantization();
@@ -926,9 +982,15 @@ TfLiteStatus InterpreterBuilder::operator()(
     return kTfLiteError;
   }
 
+  int num_add_specializations = 0;
+  for (const auto& spec : subgraph_specializations_) {
+    if (!spec.signature_key.empty()) ++num_add_specializations;
+  }
+
   auto tmp_interpreter = std::make_unique<Interpreter>(error_reporter_);
-  if (subgraphs->size() > 1) {
-    tmp_interpreter->AddSubgraphs(subgraphs->size() - 1);
+  if (subgraphs->size() + num_add_specializations > 1) {
+    tmp_interpreter->AddSubgraphs(subgraphs->size() + num_add_specializations -
+                                  1);
   }
 
   // Set num threads after all the subgraphs are added.
@@ -950,50 +1012,14 @@ TfLiteStatus InterpreterBuilder::operator()(
 
   for (int subgraph_index = 0; subgraph_index < subgraphs->size();
        ++subgraph_index) {
-    const tflite::SubGraph* subgraph = (*subgraphs)[subgraph_index];
-    tflite::Subgraph* modified_subgraph =
-        tmp_interpreter->subgraph(subgraph_index);
-    modified_subgraph->allocation_ = allocation_;
     auto* subgraph_info =
         telemetry_registered
             ? &telemetry_settings->subgraph_infos[subgraph_index]
             : nullptr;
-    auto operators = subgraph->operators();
-    auto tensors = subgraph->tensors();
-    if (!tensors) {
-      TF_LITE_REPORT_ERROR(error_reporter_,
-                           "Did not get tensors in subgraph %d.\n",
-                           subgraph_index);
+    if (BuildSubgraph((*subgraphs)[subgraph_index], buffers,
+                      tmp_interpreter->subgraph(subgraph_index), subgraph_info,
+                      subgraph_index) != kTfLiteOk) {
       return kTfLiteError;
-    }
-    if (modified_subgraph->AddTensors(tensors->size()) != kTfLiteOk) {
-      return kTfLiteError;
-    }
-    // Parse inputs/outputs
-    modified_subgraph->SetInputs(
-        FlatBufferIntArrayToVector(subgraph->inputs()));
-    modified_subgraph->SetOutputs(
-        FlatBufferIntArrayToVector(subgraph->outputs()));
-
-    // Finally setup nodes and tensors
-    // Parse tensors before nodes as ParseNodes checks input tensors for the
-    // nodes.
-    if (ParseTensors(buffers, tensors, modified_subgraph, subgraph_info) !=
-        kTfLiteOk)
-      return kTfLiteError;
-    if (operators && ParseNodes(operators, modified_subgraph) != kTfLiteOk)
-      return kTfLiteError;
-
-    std::vector<int> variables;
-    for (int i = 0; i < modified_subgraph->tensors_size(); ++i) {
-      auto* tensor = modified_subgraph->tensor(i);
-      if (tensor->is_variable) {
-        variables.push_back(i);
-      }
-    }
-    modified_subgraph->SetVariables(std::move(variables));
-    if (subgraph->name()) {
-      modified_subgraph->SetName(subgraph->name()->c_str());
     }
   }
 
@@ -1002,16 +1028,30 @@ TfLiteStatus InterpreterBuilder::operator()(
     return kTfLiteError;
   }
 
+  if (!subgraph_specializations_.empty() &&
+      ApplySubgraphSpecializations(tmp_interpreter.get(), subgraphs->size()) !=
+          kTfLiteOk) {
+    return kTfLiteError;
+  }
+
   if (options_.GetUseSignatureTensorNames()) {
-    for (auto& signature_def : tmp_interpreter->signature_defs_) {
-      auto* subgraph = tmp_interpreter->subgraph(signature_def.subgraph_index);
-      for (auto& [name, tensor_index] : signature_def.inputs) {
-        auto tensor = subgraph->tensor(tensor_index);
-        tensor->name = name.c_str();
+    for (const auto& signature_def : tmp_interpreter->signature_defs_) {
+      Subgraph* subgraph =
+          tmp_interpreter->subgraph(signature_def.subgraph_index);
+      if (subgraph == nullptr) {
+        continue;
       }
-      for (auto& [name, tensor_index] : signature_def.outputs) {
-        auto tensor = subgraph->tensor(tensor_index);
-        tensor->name = name.c_str();
+      for (const auto& [name, tensor_index] : signature_def.inputs) {
+        TfLiteTensor* tensor = subgraph->tensor(tensor_index);
+        if (tensor != nullptr) {
+          tensor->name = name.c_str();
+        }
+      }
+      for (const auto& [name, tensor_index] : signature_def.outputs) {
+        TfLiteTensor* tensor = subgraph->tensor(tensor_index);
+        if (tensor != nullptr) {
+          tensor->name = name.c_str();
+        }
       }
     }
   }
@@ -1044,6 +1084,189 @@ TfLiteStatus InterpreterBuilder::operator()(
   }
 
   *interpreter = std::move(tmp_interpreter);
+  return kTfLiteOk;
+}
+
+TfLiteStatus InterpreterBuilder::BuildSubgraph(
+    const ::tflite::SubGraph* subgraph,
+    const flatbuffers::Vector<flatbuffers::Offset<Buffer>>* buffers,
+    Subgraph* modified_subgraph, TfLiteTelemetrySubgraphInfo* subgraph_info,
+    int subgraph_index) {
+  modified_subgraph->allocation_ = allocation_;
+  auto operators = subgraph->operators();
+  auto tensors = subgraph->tensors();
+  if (!tensors) {
+    TF_LITE_REPORT_ERROR(error_reporter_,
+                         "Did not get tensors in subgraph %d.\n",
+                         subgraph_index);
+    return kTfLiteError;
+  }
+  if (modified_subgraph->AddTensors(tensors->size()) != kTfLiteOk) {
+    return kTfLiteError;
+  }
+  // Parse inputs/outputs
+  modified_subgraph->SetInputs(FlatBufferIntArrayToVector(subgraph->inputs()));
+  modified_subgraph->SetOutputs(
+      FlatBufferIntArrayToVector(subgraph->outputs()));
+
+  // Finally setup nodes and tensors
+  // Parse tensors before nodes as ParseNodes checks input tensors for the
+  // nodes.
+  if (ParseTensors(buffers, tensors, modified_subgraph, subgraph_info) !=
+      kTfLiteOk)
+    return kTfLiteError;
+  if (operators && ParseNodes(operators, modified_subgraph) != kTfLiteOk)
+    return kTfLiteError;
+
+  std::vector<int> variables;
+  for (int i = 0; i < modified_subgraph->tensors_size(); ++i) {
+    auto* tensor = modified_subgraph->tensor(i);
+    if (tensor->is_variable) {
+      variables.push_back(i);
+    }
+  }
+  modified_subgraph->SetVariables(std::move(variables));
+  if (subgraph->name()) {
+    modified_subgraph->SetName(subgraph->name()->c_str());
+  }
+  return kTfLiteOk;
+}
+
+TfLiteStatus InterpreterBuilder::ApplySubgraphSpecializations(
+    Interpreter* interpreter, int num_model_subgraphs) {
+  auto* subgraphs = model_->subgraphs();
+  auto* buffers = model_->buffers();
+  int next_subgraph_index = num_model_subgraphs;
+
+  // Keys must not collide with each other or with the model's own signatures.
+  for (size_t i = 0; i < subgraph_specializations_.size(); ++i) {
+    const auto& key = subgraph_specializations_[i].signature_key;
+    if (key.empty()) continue;
+    for (const auto& existing : interpreter->signature_defs_) {
+      if (existing.signature_key == key) {
+        TF_LITE_REPORT_ERROR(error_reporter_,
+                             "Subgraph specialization key '%s' collides with "
+                             "an existing signature.\n",
+                             key.c_str());
+        return kTfLiteError;
+      }
+    }
+    for (size_t j = 0; j < i; ++j) {
+      if (subgraph_specializations_[j].signature_key == key) {
+        TF_LITE_REPORT_ERROR(error_reporter_,
+                             "Subgraph specialization key '%s' is used more "
+                             "than once.\n",
+                             key.c_str());
+        return kTfLiteError;
+      }
+    }
+  }
+
+  for (const auto& spec : subgraph_specializations_) {
+    const int source_index = spec.source_subgraph_index;
+    if (source_index < 0 || source_index >= num_model_subgraphs) {
+      TF_LITE_REPORT_ERROR(error_reporter_,
+                           "Subgraph specialization source index %d is out "
+                           "of range [0, %d).\n",
+                           source_index, num_model_subgraphs);
+      return kTfLiteError;
+    }
+    const ::tflite::SubGraph* fb_subgraph = (*subgraphs)[source_index];
+    const bool is_add = !spec.signature_key.empty();
+
+    Subgraph* target = nullptr;
+    int target_index = source_index;
+    if (is_add) {
+      target_index = next_subgraph_index++;
+      target = interpreter->subgraph(target_index);
+      if (BuildSubgraph(fb_subgraph, buffers, target, /*subgraph_info=*/nullptr,
+                        source_index) != kTfLiteOk) {
+        return kTfLiteError;
+      }
+    } else {
+      target = interpreter->subgraph(source_index);
+    }
+
+    const std::vector<int>& input_tensors = target->inputs();
+    for (const auto& [input_position, dims] : spec.input_dims) {
+      if (input_position < 0 ||
+          input_position >= static_cast<int>(input_tensors.size())) {
+        TF_LITE_REPORT_ERROR(error_reporter_,
+                             "Subgraph specialization input position %d is "
+                             "out of range for subgraph %d with %zu inputs.\n",
+                             input_position, source_index,
+                             input_tensors.size());
+        return kTfLiteError;
+      }
+      if (target->ResizeInputTensor(input_tensors[input_position], dims) !=
+          kTfLiteOk) {
+        TF_LITE_REPORT_ERROR(error_reporter_,
+                             "Subgraph specialization failed to resize input "
+                             "%d of subgraph %d.\n",
+                             input_position, source_index);
+        return kTfLiteError;
+      }
+    }
+
+    if (!is_add) continue;
+
+    // Mirror the source signature's aliases. Tensor indices are identical in
+    // the clone because it was parsed from the same flatbuffer subgraph.
+    internal::SignatureDef new_def;
+    new_def.signature_key = spec.signature_key;
+    new_def.subgraph_index = target_index;
+    const internal::SignatureDef* source_def = nullptr;
+    for (const auto& existing : interpreter->signature_defs_) {
+      if (!spec.source_signature_key.empty()) {
+        if (existing.signature_key == spec.source_signature_key) {
+          source_def = &existing;
+          break;
+        }
+      } else if (static_cast<int>(existing.subgraph_index) == source_index) {
+        source_def = &existing;
+        break;
+      }
+    }
+    if (!spec.source_signature_key.empty() && source_def == nullptr) {
+      TF_LITE_REPORT_ERROR(error_reporter_,
+                           "Subgraph specialization source signature '%s' "
+                           "not found.\n",
+                           spec.source_signature_key.c_str());
+      return kTfLiteError;
+    }
+    if (source_def != nullptr) {
+      if (static_cast<int>(source_def->subgraph_index) != source_index) {
+        TF_LITE_REPORT_ERROR(error_reporter_,
+                             "Subgraph specialization source signature '%s' "
+                             "does not refer to subgraph %d.\n",
+                             source_def->signature_key.c_str(), source_index);
+        return kTfLiteError;
+      }
+      new_def.inputs = source_def->inputs;
+      new_def.outputs = source_def->outputs;
+    } else {
+      // No SignatureDef to mirror: name the aliases like
+      // Interpreter::CreatePlaceholderSignatureDef does, so a model without
+      // signatures exposes the same names on the clone as on its default
+      // runner. ParseTensors stores "" (not nullptr) for unnamed tensors, and
+      // optional (-1) I/O entries have no tensor at all.
+      auto add_aliases = [target](const std::vector<int>& tensor_indices,
+                                  const char* prefix,
+                                  std::map<std::string, uint32_t>* aliases) {
+        for (size_t i = 0; i < tensor_indices.size(); ++i) {
+          const int tensor_index = tensor_indices[i];
+          const TfLiteTensor* tensor = target->tensor(tensor_index);
+          if (tensor == nullptr) continue;
+          const bool named = tensor->name != nullptr && *tensor->name != '\0';
+          (*aliases)[named ? std::string(tensor->name)
+                           : prefix + std::to_string(i)] = tensor_index;
+        }
+      };
+      add_aliases(target->inputs(), "input", &new_def.inputs);
+      add_aliases(target->outputs(), "output", &new_def.outputs);
+    }
+    interpreter->signature_defs_.push_back(std::move(new_def));
+  }
   return kTfLiteOk;
 }
 

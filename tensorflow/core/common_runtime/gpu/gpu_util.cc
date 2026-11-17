@@ -19,7 +19,9 @@ limitations under the License.
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
+#include <utility>
 
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -52,10 +54,18 @@ limitations under the License.
 #if (defined(GOOGLE_CUDA) && GOOGLE_CUDA) || \
     (defined(TENSORFLOW_USE_ROCM) && TENSORFLOW_USE_ROCM)
 #include "tensorflow/compiler/jit/pjrt_tensor_buffer.h"
+#include "tensorflow/compiler/jit/pjrt_tensor_buffer_util.h"
 #include "tensorflow/compiler/tf2xla/literal_util.h"
+#include "tensorflow/compiler/tf2xla/shape_util.h"
 #include "xla/future.h"
+#include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/literal.h"
+#include "xla/pjrt/pjrt_client.h"
+#include "xla/primitive_util.h"
+#include "xla/shape.h"
+#include "xla/tsl/framework/device_id_utils.h"
+#include "tensorflow/core/tfrt/common/pjrt_util.h"
 #endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 // IMPLEMENTATION NOTE:
@@ -316,6 +326,42 @@ bool NeedStaging(const Tensor* tensor) {
   return tensor->GetMemoryType() == AllocatorMemoryType::kHostPageable;
 }
 
+#if (defined(GOOGLE_CUDA) && GOOGLE_CUDA) || \
+    (defined(TENSORFLOW_USE_ROCM) && TENSORFLOW_USE_ROCM)
+const PjRtTensorBuffer* GetPjRtTensorBuffer(const Tensor* tensor) {
+  const TensorBuffer* buf = DMAHelper::buffer(tensor);
+  if (buf == nullptr) {
+    return nullptr;
+  }
+  if (const auto* pjrt_buf = dynamic_cast<const PjRtTensorBuffer*>(buf)) {
+    return pjrt_buf;
+  }
+  const TensorBuffer* root_buf = const_cast<TensorBuffer*>(buf)->root_buffer();
+  if (root_buf != buf && root_buf != nullptr &&
+      root_buf->data() == buf->data() && root_buf->size() == buf->size()) {
+    return dynamic_cast<const PjRtTensorBuffer*>(root_buf);
+  }
+  return nullptr;
+}
+
+bool CanCopyPjRtBufferDirectly(const xla::PjRtBuffer& pjrt_buffer) {
+  if (pjrt_buffer.has_dynamic_dimensions()) {
+    return false;
+  }
+  const xla::Shape& shape = pjrt_buffer.on_device_shape();
+  if (shape.IsTuple() ||
+      xla::primitive_util::IsSubByteNonPredType(shape.element_type())) {
+    return false;
+  }
+  if (shape.has_layout()) {
+    return xla::Layout::Equal().IgnoreMemorySpace()(
+        shape.layout(),
+        xla::LayoutUtil::MakeDescendingLayout(shape.dimensions().size()));
+  }
+  return true;
+}
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+
 }  // namespace
 
 void GPUUtil::CopyGPUTensorToCPU(Device* gpu_device,
@@ -352,38 +398,60 @@ void GPUUtil::CopyGPUTensorToCPU(Device* gpu_device,
 
 #if (defined(GOOGLE_CUDA) && GOOGLE_CUDA) || \
     (defined(TENSORFLOW_USE_ROCM) && TENSORFLOW_USE_ROCM)
-  // The above `WaitFor(send_stream)` for the PjRt case eliminates race
-  // conditions caused by either non-XLA ops that have not finished or a case in
-  // the PJRT client implementation where an event on the buffer is not sent
-  // properly. A possible future improvement is to specifically handle the
-  // relevant case(s) and move this codeblock to the start of
-  // this function (avoiding the need for `WaitFor(send_stream)` for the
-  // PjRt case).
-  const PjRtTensorBuffer* pjrt_tensor_buffer =
-      dynamic_cast<const PjRtTensorBuffer*>(DMAHelper::buffer(gpu_tensor));
+  const PjRtTensorBuffer* pjrt_tensor_buffer = GetPjRtTensorBuffer(gpu_tensor);
   if (pjrt_tensor_buffer != nullptr) {
-    VLOG(1) << "CopyGPUTensorToCPU using PjRtTensorBuffer";
-    std::unique_ptr<xla::MutableBorrowingLiteral> literal;
-    if (pjrt_tensor_buffer->pjrt_buffer()->has_dynamic_dimensions()) {
-      literal = std::make_unique<xla::MutableBorrowingLiteral>();
-      auto status = tensorflow::HostTensorToMutableBorrowingLiteral(
-          cpu_tensor, literal.get());
-      if (!status.ok()) {
-        done(status);
-        return;
+    xla::PjRtBuffer* pjrt_buffer = pjrt_tensor_buffer->pjrt_buffer();
+    if (CanCopyPjRtBufferDirectly(*pjrt_buffer)) {
+      // Synchronize `send_device_to_host_stream` with the PjRt buffer's
+      // definition event on the GPU without blocking the host on GPU compute
+      // completion, then fall through to the AcceleratorDeviceInfo Memcpy path.
+      // When `pjrt_buffer` is on `gpu_device`, `send_device_to_host_stream`
+      // is already synchronized with `gpu_device`'s compute stream
+      // (`send_stream`) above. `TensorReference input_ref(*gpu_tensor)` below
+      // keeps `PjRtTensorBuffer` alive (and `RefCountIsOne() == false`,
+      // preventing buffer donation) until the Memcpy completes on
+      // `send_device_to_host_stream`.
+      const int gpu_device_id =
+          tsl::GetDeviceIdFromDeviceParsedName(gpu_device->parsed_name());
+      if (pjrt_buffer->device() == nullptr ||
+          pjrt_buffer->device()->local_device_id().value() != gpu_device_id) {
+        absl::StatusOr<std::unique_ptr<xla::PjRtBuffer::ExternalReference>>
+            ref = pjrt_buffer->AcquireExternalReference();
+        if (!ref.ok()) {
+          done(ref.status());
+          return;
+        }
+        absl::Status wait_status =
+            (*ref)->WaitUntilBufferReadyOnStream(absl::bit_cast<std::intptr_t>(
+                send_device_to_host_stream->platform_specific_handle().stream));
+        if (!wait_status.ok()) {
+          done(wait_status);
+          return;
+        }
       }
     } else {
-      xla::Shape shape = pjrt_tensor_buffer->pjrt_buffer()->on_device_shape();
-      *shape.mutable_layout() =
-          xla::LayoutUtil::MakeDescendingLayout(shape.dimensions().size());
-      literal = std::make_unique<xla::MutableBorrowingLiteral>(
-          cpu_tensor->tensor_data().data(), shape);
+      VLOG(1) << "CopyGPUTensorToCPU using PjRtTensorBuffer::ToLiteral";
+      std::unique_ptr<xla::MutableBorrowingLiteral> literal;
+      if (pjrt_buffer->has_dynamic_dimensions()) {
+        literal = std::make_unique<xla::MutableBorrowingLiteral>();
+        auto status = tensorflow::HostTensorToMutableBorrowingLiteral(
+            cpu_tensor, literal.get());
+        if (!status.ok()) {
+          done(status);
+          return;
+        }
+      } else {
+        xla::Shape shape = pjrt_buffer->on_device_shape();
+        *shape.mutable_layout() =
+            xla::LayoutUtil::MakeDescendingLayout(shape.dimensions().size());
+        literal = std::make_unique<xla::MutableBorrowingLiteral>(
+            cpu_tensor->tensor_data().data(), shape);
+      }
+      tsl::Future<void> future = pjrt_buffer->ToLiteral(literal.get());
+      future.OnReady([literal = std::move(literal),
+                      done](const absl::Status& status) { done(status); });
+      return;
     }
-    tsl::Future<void> future =
-        pjrt_tensor_buffer->pjrt_buffer()->ToLiteral(literal.get());
-    future.OnReady([literal = std::move(literal),
-                    done](const absl::Status& status) { done(status); });
-    return;
   }
 #endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
@@ -492,6 +560,48 @@ void GPUUtil::CopyCPUTensorToGPU(const Tensor* cpu_tensor,
       done(s);
       return;
     }
+
+#if (defined(GOOGLE_CUDA) && GOOGLE_CUDA) || \
+    (defined(TENSORFLOW_USE_ROCM) && TENSORFLOW_USE_ROCM)
+    if (dev_info->use_pjrt_tensor_buffer &&
+        dynamic_cast<const PjRtTensorBuffer*>(DMAHelper::buffer(gpu_tensor)) ==
+            nullptr) {
+      xla::Shape device_shape;
+      if (TensorShapeToXLAShape(gpu_tensor->dtype(), gpu_tensor->shape(),
+                                &device_shape)
+              .ok() &&
+          !xla::primitive_util::IsSubByteNonPredType(
+              device_shape.element_type())) {
+        absl::StatusOr<xla::PjRtClient*> pjrt_client =
+            GetPjRtClient(DeviceType(DEVICE_GPU));
+        if (pjrt_client.ok()) {
+          const int pjrt_device_id =
+              tsl::GetDeviceIdFromDeviceParsedName(gpu_device->parsed_name());
+          absl::StatusOr<xla::PjRtDevice*> pjrt_device =
+              (*pjrt_client)
+                  ->LookupAddressableDevice(xla::LocalDeviceId(pjrt_device_id));
+          if (pjrt_device.ok()) {
+            absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffer =
+                (*pjrt_client)
+                    ->CreateViewOfDeviceBuffer(dst_ptr, device_shape,
+                                               (*pjrt_device)
+                                                   ->default_memory_space()
+                                                   .value_or(nullptr),
+                                               [tensor = *gpu_tensor]() {});
+            if (pjrt_buffer.ok()) {
+              s = PjRtTensorBufferUtil::UpdateOrMakeTensorWithPjRtBuffer(
+                  gpu_tensor->dtype(), gpu_tensor->shape(),
+                  std::move(*pjrt_buffer), gpu_tensor);
+              if (!s.ok()) {
+                done(s);
+                return;
+              }
+            }
+          }
+        }
+      }
+    }
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
   }
 
   if (merge_host_to_device_stream) {

@@ -365,7 +365,76 @@ func.func @dus(%arg0: tensor<20x30xf32>, %arg1: tensor<5x6xf32>, %arg2: i32, %ar
 // -----
 
 module {
-  func.func @annotate_range_abs_index(%v: i32) -> index {
+  func.func @abs_index_clamp(%v: i32) -> index {
+    %c0_i32 = arith.constant 0 : i32
+    %c0 = arith.constant 0 : index
+    %c15 = arith.constant 15 : index
+    %0 = arith.cmpi sge, %v, %c0_i32 : i32
+    %1 = arith.subi %c0_i32, %v : i32
+    %2 = arith.select %0, %v, %1 : i32
+    %3 = arith.index_cast %2 : i32 to index
+    %4 = arith.minsi %3, %c15 : index
+    %5 = arith.maxsi %4, %c0 : index
+    return %5: index
+  }
+}
+
+// COM: |x| is negative if x is the minimum signed value, so the result must
+// COM: not be annotated as non-negative. The clamp is rewritten to an unsigned
+// COM: minimum instead, which also clamps the minimum signed value.
+// CHECK-LABEL: @abs_index_clamp
+// CHECK: %[[C15:.*]] = arith.constant 15 : index
+// CHECK: %[[ABS:.*]] = arith.select
+// CHECK-NOT: xla.range
+// CHECK: %[[CAST:.*]] = arith.index_castui %[[ABS]] : i32 to index
+// CHECK-NEXT: %[[MIN:.*]] = arith.minui %[[CAST]], %[[C15]]
+// CHECK-SAME: xla.range = [0 : index, 15 : index]
+// CHECK-NEXT: return %[[MIN]]
+
+// -----
+
+module {
+  func.func @non_abs_index_clamp(%v: i32, %w: i32) -> index {
+    %c0_i32 = arith.constant 0 : i32
+    %c0 = arith.constant 0 : index
+    %c15 = arith.constant 15 : index
+    %0 = arith.cmpi sge, %v, %c0_i32 : i32
+    %1 = arith.subi %c0_i32, %w : i32
+    %2 = arith.select %0, %v, %1 : i32
+    %3 = arith.index_cast %2 : i32 to index
+    %4 = arith.minsi %3, %c15 : index
+    %5 = arith.maxsi %4, %c0 : index
+    return %5: index
+  }
+}
+
+// CHECK-LABEL: @non_abs_index_clamp
+// CHECK: %[[MIN:.*]] = arith.minsi
+// CHECK: %[[MAX:.*]] = arith.maxsi %[[MIN]]
+// CHECK: return %[[MAX]]
+
+// -----
+
+module {
+  func.func @annotate_range_abs_int_min(%v: i32 {xla.range = [-2147483648 : i32, 17 : i32]}) -> index {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = arith.cmpi sge, %v, %c0_i32 : i32
+    %1 = arith.subi %c0_i32, %v : i32
+    %2 = arith.select %0, %v, %1 : i32
+    %3 = arith.index_cast %2 : i32 to index
+    return %3: index
+  }
+}
+
+// CHECK-LABEL: @annotate_range_abs_int_min
+// CHECK: arith.select
+// CHECK-NOT: xla.range
+// CHECK: return
+
+// -----
+
+module {
+  func.func @annotate_range_abs_index(%v: i32 {xla.range = [-2147483647 : i32, 17 : i32]}) -> index {
     %c0_i32 = arith.constant 0 : i32
     %0 = arith.cmpi sge, %v, %c0_i32 : i32
     %1 = arith.subi %c0_i32, %v : i32
@@ -479,7 +548,18 @@ module {
 // CHECK-NEXT: %[[CST:.*]] = arith.constant dense<true> : tensor<4xi1>
 // CHECK-NEXT: return %[[CST]]
 
+// -----
 
+#constrained_map = #xla.indexing_map<"(d0, d1) -> ((d0 * 21846 + d1) floordiv 256), domain: d0 in [0, 11], d1 in [0, 21845]">
+module {
+  func.func @apply_indexing_range_attr(%pid: index, %tid: index) -> i1 {
+    %row = xla.apply_indexing #constrained_map(%pid, %tid) {xla.range = [0 : index, 1023 : index]}
+    %c1024 = arith.constant 1024 : index
+    %in_bounds = arith.cmpi slt, %row, %c1024 : index
+    return %in_bounds : i1
+  }
+}
 
-
-
+// CHECK-LABEL: @apply_indexing_range_attr
+// CHECK-NEXT: %[[TRUE:.*]] = arith.constant true
+// CHECK-NEXT: return %[[TRUE]]

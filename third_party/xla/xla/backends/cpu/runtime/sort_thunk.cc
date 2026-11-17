@@ -29,9 +29,9 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/attributes.h"
 #include "absl/base/call_once.h"
 #include "absl/base/dynamic_annotations.h"
-#include "absl/base/optimization.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status_macros.h"
@@ -60,6 +60,18 @@ limitations under the License.
 #include "unsupported/Eigen/CXX11/Tensor"
 
 namespace xla::cpu {
+
+// Adapts a jit-compiled comparator to LessThan.  Jit-compiled functions have no
+// CFI type hashes, so the indirect call into them must skip the CFI check.
+namespace {
+struct JitComparator {
+  FunctionLibrary::Comparator* comparator;
+
+  ABSL_ATTRIBUTE_NO_SANITIZE_CFI bool operator()(const void** data) const {
+    return comparator(data);
+  }
+};
+}  // namespace
 
 // Conceptually we have a 3-dimensional shape:
 //
@@ -206,17 +218,11 @@ tsl::AsyncValueRef<SortThunk::ExecuteEvent> SortThunk::Execute(
     absl::StatusOr<FunctionLibrary::Comparator*> comparator =
         params.function_library->ResolveFunction<FunctionLibrary::Comparator>(
             comparator_name_);
-
-    if (ABSL_PREDICT_TRUE(comparator.ok())) {
-      less_than_ = [comparator](const void** data) {
-        bool result;
-        (*comparator)(&result, nullptr, data, nullptr, nullptr, nullptr);
-        ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&result, sizeof(result));
-        return result;
-      };
-    } else {
-      less_than_ = std::move(comparator.status());
+    if (!comparator.ok()) {
+      less_than_ = comparator.status();
+      return;
     }
+    less_than_ = LessThan(JitComparator{*comparator});
   });
 
   ABSL_RETURN_IF_ERROR(less_than_.status());
@@ -239,10 +245,7 @@ tsl::AsyncValueRef<SortThunk::ExecuteEvent> SortThunk::Execute(
     if (raw_data.size() == 1 && direction.has_value()) {
       primitive_util::ArrayTypeSwitch(
           [&](auto type) {
-            if constexpr ((primitive_util::IsFloatingPointType(type) &&
-                           primitive_util::BitWidth(type) >= 16) ||
-                          (primitive_util::IsIntegralType(type) &&
-                           primitive_util::BitWidth(type) >= 8)) {
+            if constexpr (IsSupportedKeyType(type)) {
               using T = primitive_util::NativeTypeOf<type>;
               internal::SortInplace<T>(sort_dims, start_slice, end_slice,
                                        reinterpret_cast<T*>(raw_data[0]),
@@ -255,14 +258,11 @@ tsl::AsyncValueRef<SortThunk::ExecuteEvent> SortThunk::Execute(
           first_element_type);
     } else if (raw_data.size() == 2 && direction.has_value() &&
                (sort_dims.inner_dim_size == 1 ||
-                sort_dims.sort_dim_size <= 65536)) {
+                sort_dims.sort_dim_size <= kMaxSortDimSize)) {
       size_t val_size = primitive_sizes[1];
       primitive_util::ArrayTypeSwitch(
           [&](auto key_type) {
-            if constexpr ((primitive_util::IsFloatingPointType(key_type) &&
-                           primitive_util::BitWidth(key_type) >= 16) ||
-                          (primitive_util::IsIntegralType(key_type) &&
-                           primitive_util::BitWidth(key_type) >= 8)) {
+            if constexpr (IsSupportedKeyType(key_type)) {
               using Key = primitive_util::NativeTypeOf<key_type>;
               auto* keys = reinterpret_cast<Key*>(raw_data[0]);
               switch (val_size) {

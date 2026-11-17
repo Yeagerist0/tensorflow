@@ -53,7 +53,10 @@ class CpuExecuteContext : public ExecuteContext {
 
   // If specified, override the intra-op thread pool for a particular call of
   // PjRtLoadedExecutable::Execute. Must remain valid until the execution
-  // finishes.
+  // finishes. Note that compilation uses the thread count of the client's
+  // intra-op thread pool for codegen decisions, so overriding with a pool of a
+  // different size may execute code tuned for a different degree of
+  // parallelism.
   const Eigen::ThreadPoolDevice* intra_op_thread_pool() const {
     return intra_op_thread_pool_;
   }

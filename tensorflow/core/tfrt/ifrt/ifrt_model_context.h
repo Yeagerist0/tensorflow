@@ -17,15 +17,21 @@ limitations under the License.
 #define TENSORFLOW_CORE_TFRT_IFRT_IFRT_MODEL_CONTEXT_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/container/inlined_vector.h"
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
 #include "tensorflow/compiler/mlir/tfrt/transforms/ifrt/tf2hlo.h"
 #include "tensorflow/compiler/tf2xla/xla_helpers.h"
 #include "xla/pjrt/pjrt_executable.h"
@@ -115,6 +121,21 @@ class IfrtModelContext {
     handles_.push_back(std::move(handle));
   }
 
+  // Returns the program id already compiled from a submodule with
+  // `fingerprint` whose call site uses the same `variable_arg_indices`, if any.
+  std::optional<int64_t> LookupProgramId(
+      uint64_t fingerprint, absl::Span<const int> variable_arg_indices) const;
+
+  // Returns true if any program was compiled from a submodule with
+  // `fingerprint`, regardless of its `variable_arg_indices`.
+  bool HasProgramWithFingerprint(uint64_t fingerprint) const;
+
+  // Records that `program_id` was compiled from a submodule with `fingerprint`
+  // and is called with `variable_arg_indices`.
+  void RegisterProgramId(uint64_t fingerprint,
+                         absl::Span<const int> variable_arg_indices,
+                         int64_t program_id);
+
   std::shared_ptr<xla::ifrt::Client> GetClient() const { return client_; }
 
   const tensorflow::XlaHelpers::ShapeRepresentationFn&
@@ -150,6 +171,12 @@ class IfrtModelContext {
   IfrtServingCoreSelector* GetIfrtServingCoreSelector() const {
     return ifrt_serving_core_selector_;
   }
+
+  void set_device_ids(absl::InlinedVector<int, 8> device_ids) {
+    device_ids_ = std::move(device_ids);
+  }
+
+  absl::Span<const int> device_ids() const { return device_ids_; }
 
   tfrt::ConcurrentWorkQueue* checkpoint_loader_queue() const {
     return checkpoint_loader_queue_;
@@ -256,6 +283,19 @@ class IfrtModelContext {
   tfrt::ConcurrentWorkQueue* checkpoint_loader_queue_ = nullptr;
 
   std::vector<ServingExecutableRegistry::Handle> handles_;
+  // A compiled program and the `variable_arg_indices` of its call site. The
+  // executable binds loaded variables by these indices, so a program is only
+  // reused by call sites with the same indices.
+  struct CompiledProgram {
+    std::vector<int> variable_arg_indices;
+    int64_t program_id;
+  };
+  // Submodule fingerprint -> compiled programs, so identical TPU clusters from
+  // different client graphs are compiled once. Client graphs may be compiled
+  // concurrently.
+  mutable absl::Mutex mutex_;
+  absl::flat_hash_map<uint64_t, std::vector<CompiledProgram>>
+      compiled_programs_by_module_fingerprint_ ABSL_GUARDED_BY(mutex_);
 
   DefaultSignatureInputConfig default_signature_inputs_;
 
@@ -268,6 +308,7 @@ class IfrtModelContext {
   bool enable_propagate_static_shapes_pass_ = true;
   bool use_output_arena_ = false;
   bool use_undonatable_buffer_converter_ = false;
+  absl::InlinedVector<int, 8> device_ids_;
 };
 
 }  // namespace ifrt_serving

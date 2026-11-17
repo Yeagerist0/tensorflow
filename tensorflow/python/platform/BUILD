@@ -30,7 +30,6 @@ visibility = [
     # copybara:uncomment "//learning/brain/contrib/eager/numlib/benchmarks/kumamon:__subpackages__",
     # copybara:uncomment "//learning/brain/mobile/lite/tooling/model_analyzer:__subpackages__",
     # copybara:uncomment "//tensorflow_serving/model_servers:__subpackages__",
-    # copybara:uncomment "//third_party/odml/model_customization/quantization:__subpackages__",
 ]
 
 package(
@@ -52,6 +51,20 @@ py_library(
 py_library(
     name = "windows_lib_diagnostics",
     srcs = ["windows_lib_diagnostics.py"],
+)
+
+tf_py_strict_test(
+    name = "windows_lib_diagnostics_test",
+    size = "small",
+    srcs = ["windows_lib_diagnostics_test.py"],
+    main = "windows_lib_diagnostics_test.py",
+    tags = [
+        "no_pip",
+    ],
+    deps = [
+        ":client_testlib",
+        ":windows_lib_diagnostics",
+    ],
 )
 
 py_library(
@@ -152,7 +165,6 @@ tf_py_strict_test(
         ":client_testlib",
         ":sysconfig",
         ":test",
-        "//tensorflow:tensorflow_py",
     ],
 )
 

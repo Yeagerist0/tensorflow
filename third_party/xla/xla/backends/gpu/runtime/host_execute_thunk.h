@@ -16,21 +16,18 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_RUNTIME_HOST_EXECUTE_THUNK_H_
 #define XLA_BACKENDS_GPU_RUNTIME_HOST_EXECUTE_THUNK_H_
 
+#include <cstdint>
 #include <memory>
-#include <optional>
 #include <string>
-#include <utility>
 
 #include "absl/base/call_once.h"
-#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/backends/gpu/runtime/command.h"
-#include "xla/backends/gpu/runtime/host_async_thunk.h"
+#include "xla/backends/gpu/runtime/per_device_state.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk.pb.h"
 #include "xla/core/host_offloading/host_offloading_allocator.h"
@@ -45,6 +42,7 @@ limitations under the License.
 #include "xla/stream_executor/command_buffer.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
+#include "xla/tsl/lib/gtl/int_type.h"
 #include "xla/types.h"  // IWYU pragma: keep
 #include "xla/util.h"
 
@@ -62,6 +60,15 @@ class HostExecuteAsyncEvents {
   // published results.
   using HostExecuteEvent = tsl::AsyncValueRef<std::unique_ptr<se::Event>>;
 
+  // Identifies the events shared by a start/done pair in a serialized
+  // executable.
+  TSL_LIB_GTL_DEFINE_INT_TYPE(UniqueId, uint64_t);
+
+  explicit HostExecuteAsyncEvents(UniqueId unique_id, int devices_per_host = 0)
+      : unique_id_(unique_id), device_events_(devices_per_host) {}
+
+  UniqueId unique_id() const { return unique_id_; }
+
   // Creates an event for the given executor and run id and returns it to the
   // user if the event was created successfully.
   absl::StatusOr<HostExecuteEvent> CreateEvent(se::StreamExecutor* executor,
@@ -71,13 +78,18 @@ class HostExecuteAsyncEvents {
                                                 RunId run_id);
 
  private:
-  absl::Mutex events_mu_;
-  absl::flat_hash_map<std::pair<se::StreamExecutor*, RunId>, HostExecuteEvent>
-      events_ ABSL_GUARDED_BY(events_mu_);
+  // Not internally synchronized. Relies on the caller serializing host-side
+  // thunk execution per device (e.g., PJRT per-device execute_thread).
+  struct DeviceEvents {
+    absl::flat_hash_map<RunId, HostExecuteEvent> events;
+  };
+
+  const UniqueId unique_id_;
+  PerDeviceState<DeviceEvents> device_events_;
 };
 
 using HostExecuteAsyncEventsMap =
-    absl::flat_hash_map<AsyncEventsUniqueId,
+    absl::flat_hash_map<HostExecuteAsyncEvents::UniqueId,
                         std::shared_ptr<HostExecuteAsyncEvents>>;
 
 class HostExecuteStartThunk : public Command {
@@ -85,13 +97,14 @@ class HostExecuteStartThunk : public Command {
   HostExecuteStartThunk(Thunk::ThunkInfo thunk_info,
                         const HloModule& hlo_module,
                         absl::InlinedVector<ShapedSlice, 4> args,
-                        absl::InlinedVector<ShapedSlice, 4> results);
+                        absl::InlinedVector<ShapedSlice, 4> results,
+                        int devices_per_host = 0);
 
   static absl::StatusOr<std::unique_ptr<HostExecuteStartThunk>> Create(
       Thunk::ThunkInfo thunk_info,
       const HostOffloadingExecutableProto& host_offloading_executable_proto,
       absl::InlinedVector<ShapedSlice, 4> args,
-      absl::InlinedVector<ShapedSlice, 4> results);
+      absl::InlinedVector<ShapedSlice, 4> results, int devices_per_host = 0);
 
   HostExecuteStartThunk(const HostExecuteStartThunk&) = delete;
   HostExecuteStartThunk& operator=(const HostExecuteStartThunk&) = delete;
@@ -107,7 +120,7 @@ class HostExecuteStartThunk : public Command {
   static absl::StatusOr<std::unique_ptr<HostExecuteStartThunk>> FromProto(
       ThunkInfo thunk_info, const HostExecuteStartThunkProto& proto,
       absl::Span<const BufferAllocation> buffer_allocations,
-      HostExecuteAsyncEventsMap& async_events_map);
+      HostExecuteAsyncEventsMap& async_events_map, int devices_per_host = 0);
 
   absl::Status Initialize(const InitializeParams& params) override;
   absl::Status ExecuteOnStream(const ExecuteParams& params) override;
@@ -146,17 +159,17 @@ class HostExecuteStartThunk : public Command {
     return &executable_proto_;
   }
 
-  std::optional<AsyncEventsUniqueId> GetAsyncEventsUniqueId() const;
-
   HostExecuteStartThunk(
       Thunk::ThunkInfo thunk_info,
       const HostOffloadingExecutableProto& host_offloading_executable_proto,
       absl::InlinedVector<ShapedSlice, 4> args,
       absl::InlinedVector<ShapedSlice, 4> results,
-      std::shared_ptr<HostExecuteAsyncEvents> async_events = nullptr);
+      std::shared_ptr<HostExecuteAsyncEvents> async_events = nullptr,
+      int devices_per_host = 0);
 
  private:
   absl::once_flag executable_init_flag_;
+  absl::Status executable_init_status_;
   std::unique_ptr<HostOffloadingExecutable> executable_;
   absl::InlinedVector<ShapedSlice, 4> args_;
   absl::InlinedVector<ShapedSlice, 4> results_;
@@ -180,7 +193,7 @@ class HostExecuteDoneThunk : public Command {
   static absl::StatusOr<std::unique_ptr<HostExecuteDoneThunk>> FromProto(
       ThunkInfo thunk_info, const HostExecuteDoneThunkProto& proto,
       absl::Span<const BufferAllocation> buffer_allocations,
-      HostExecuteAsyncEventsMap& async_events_map);
+      HostExecuteAsyncEventsMap& async_events_map, int devices_per_host = 0);
 
   absl::Status Initialize(const InitializeParams& params) override;
   absl::Status ExecuteOnStream(const ExecuteParams& params) override;
@@ -200,7 +213,11 @@ class HostExecuteDoneThunk : public Command {
     return res;
   }
 
-  std::optional<AsyncEventsUniqueId> GetAsyncEventsUniqueId() const;
+  // Returns the async events shared with the corresponding
+  // HostExecuteStartThunk.
+  std::shared_ptr<HostExecuteAsyncEvents> async_events() const {
+    return async_events_;
+  }
 
  private:
   std::shared_ptr<HostExecuteAsyncEvents> async_events_;

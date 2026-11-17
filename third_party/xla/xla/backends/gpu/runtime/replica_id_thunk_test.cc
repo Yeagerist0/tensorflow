@@ -30,6 +30,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/command_state.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk.pb.h"
+#include "xla/backends/gpu/runtime/thunk_test_utils.h"
 #include "xla/runtime/device_id.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/device_assignment.h"
@@ -43,8 +44,6 @@ limitations under the License.
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/stream_executor/stream_executor_address_allocator.h"
-#include "xla/tsl/lib/core/status_test_util.h"
-#include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/util/proto/proto_matchers.h"
 
 namespace xla::gpu {
@@ -78,12 +77,12 @@ TEST(ReplicaIdThunkTest, ProtoRoundTrip) {
 
   Thunk::ThunkInfo thunk_info;
   thunk_info.profile_annotation = proto.thunk_info().profile_annotation();
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<ReplicaIdThunk> thunk,
       ReplicaIdThunk::FromProto(thunk_info, proto.replica_id_thunk(),
                                 buffer_allocations));
 
-  TF_ASSERT_OK_AND_ASSIGN(ThunkProto round_trip_proto, thunk->ToProto());
+  ASSERT_OK_AND_ASSIGN(ThunkProto round_trip_proto, thunk->ToProto());
   EXPECT_THAT(round_trip_proto, EqualsProto(proto));
 }
 
@@ -102,12 +101,12 @@ TEST(PartitionIdThunkTest, ProtoRoundTrip) {
 
   Thunk::ThunkInfo thunk_info;
   thunk_info.profile_annotation = proto.thunk_info().profile_annotation();
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<PartitionIdThunk> thunk,
       PartitionIdThunk::FromProto(thunk_info, proto.partition_id_thunk(),
                                   buffer_allocations));
 
-  TF_ASSERT_OK_AND_ASSIGN(ThunkProto round_trip_proto, thunk->ToProto());
+  ASSERT_OK_AND_ASSIGN(ThunkProto round_trip_proto, thunk->ToProto());
   EXPECT_THAT(round_trip_proto, EqualsProto(proto));
 }
 
@@ -119,10 +118,10 @@ TEST(PartitionIdThunkTest, ProtoRoundTrip) {
 // (replica 0 -> device 1, replica 1 -> device 0), so the expected value is 1.
 TEST(ReplicaIdThunkTest, ExecuteOnStream) {
   se::StreamExecutor* executor = GpuExecutor();
-  TF_ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
+  ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
 
   se::DeviceAddress<uint32_t> dest = executor->AllocateArray<uint32_t>(1, 0);
-  TF_ASSERT_OK(stream->MemZero(&dest, sizeof(uint32_t)));
+  ASSERT_OK(stream->MemZero(&dest, sizeof(uint32_t)));
 
   BufferAllocation alloc(/*index=*/0, sizeof(uint32_t), /*color=*/0);
   BufferAllocation::Slice slice(&alloc, 0, sizeof(uint32_t));
@@ -142,7 +141,7 @@ TEST(ReplicaIdThunkTest, ExecuteOnStream) {
   run_options.mutable_run_options()->set_gpu_executable_run_options(
       &gpu_options);
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       CollectiveParams collective_params,
       CollectiveParams::Create(run_options, /*async_streams=*/{},
                                LocalDeviceId(executor->device_ordinal())));
@@ -152,15 +151,15 @@ TEST(ReplicaIdThunkTest, ExecuteOnStream) {
   se::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations buffer_allocations({dest}, 0, &allocator);
 
-  Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
-      run_options, buffer_allocations, stream.get(),
-      /*command_buffer_trace_stream=*/nullptr, &collective_params,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &buffer_allocations, stream.get());
+  thunk_params.WithRunOptions(&run_options)
+      .WithCollectiveParams(&collective_params);
+  Thunk::ExecuteParams execute_params = thunk_params.ExecuteParams();
 
-  TF_ASSERT_OK(thunk.ExecuteOnStream(execute_params));
+  ASSERT_OK(thunk.ExecuteOnStream(execute_params));
 
   uint32_t result = 0;
-  TF_ASSERT_OK(stream->Memcpy(&result, dest, sizeof(uint32_t)));
+  ASSERT_OK(stream->Memcpy(&result, dest, sizeof(uint32_t)));
   EXPECT_EQ(result, 1u);  // device 0 is replica 1
 }
 
@@ -168,10 +167,10 @@ TEST(ReplicaIdThunkTest, ExecuteOnStream) {
 // ((r0,p0) -> device 1, (r0,p1) -> device 0), so the expected value is 1.
 TEST(PartitionIdThunkTest, ExecuteOnStream) {
   se::StreamExecutor* executor = GpuExecutor();
-  TF_ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
+  ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
 
   se::DeviceAddress<uint32_t> dest = executor->AllocateArray<uint32_t>(1, 0);
-  TF_ASSERT_OK(stream->MemZero(&dest, sizeof(uint32_t)));
+  ASSERT_OK(stream->MemZero(&dest, sizeof(uint32_t)));
 
   BufferAllocation alloc(/*index=*/0, sizeof(uint32_t), /*color=*/0);
   BufferAllocation::Slice slice(&alloc, 0, sizeof(uint32_t));
@@ -191,7 +190,7 @@ TEST(PartitionIdThunkTest, ExecuteOnStream) {
   run_options.mutable_run_options()->set_gpu_executable_run_options(
       &gpu_options);
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       CollectiveParams collective_params,
       CollectiveParams::Create(run_options, /*async_streams=*/{},
                                LocalDeviceId(executor->device_ordinal())));
@@ -201,15 +200,15 @@ TEST(PartitionIdThunkTest, ExecuteOnStream) {
   se::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations buffer_allocations({dest}, 0, &allocator);
 
-  Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
-      run_options, buffer_allocations, stream.get(),
-      /*command_buffer_trace_stream=*/nullptr, &collective_params,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &buffer_allocations, stream.get());
+  thunk_params.WithRunOptions(&run_options)
+      .WithCollectiveParams(&collective_params);
+  Thunk::ExecuteParams execute_params = thunk_params.ExecuteParams();
 
-  TF_ASSERT_OK(thunk.ExecuteOnStream(execute_params));
+  ASSERT_OK(thunk.ExecuteOnStream(execute_params));
 
   uint32_t result = 0;
-  TF_ASSERT_OK(stream->Memcpy(&result, dest, sizeof(uint32_t)));
+  ASSERT_OK(stream->Memcpy(&result, dest, sizeof(uint32_t)));
   EXPECT_EQ(result, 1u);  // device 0 is partition 1
 }
 
@@ -219,10 +218,10 @@ TEST(PartitionIdThunkTest, ExecuteOnStream) {
 
 TEST(ReplicaIdThunkTest, RecordCommandBuffer) {
   se::StreamExecutor* executor = GpuExecutor();
-  TF_ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
+  ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
 
   se::DeviceAddress<uint32_t> dest = executor->AllocateArray<uint32_t>(1, 0);
-  TF_ASSERT_OK(stream->MemZero(&dest, sizeof(uint32_t)));
+  ASSERT_OK(stream->MemZero(&dest, sizeof(uint32_t)));
 
   BufferAllocation alloc(/*index=*/0, sizeof(uint32_t), /*color=*/0);
   BufferAllocation::Slice slice(&alloc, 0, sizeof(uint32_t));
@@ -242,7 +241,7 @@ TEST(ReplicaIdThunkTest, RecordCommandBuffer) {
   run_options.mutable_run_options()->set_gpu_executable_run_options(
       &gpu_options);
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       CollectiveParams collective_params,
       CollectiveParams::Create(run_options, /*async_streams=*/{},
                                LocalDeviceId(executor->device_ordinal())));
@@ -252,38 +251,37 @@ TEST(ReplicaIdThunkTest, RecordCommandBuffer) {
   se::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations buffer_allocations({dest}, 0, &allocator);
 
-  Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
-      run_options, buffer_allocations, stream.get(),
-      /*command_buffer_trace_stream=*/nullptr, &collective_params,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &buffer_allocations, stream.get());
+  thunk_params.WithRunOptions(&run_options)
+      .WithCollectiveParams(&collective_params);
+  Thunk::ExecuteParams execute_params = thunk_params.ExecuteParams();
 
   CommandStateManager state;
   Command::RecordParams record_params = {state};
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto command_buffer,
       executor->CreateCommandBuffer(se::CommandBuffer::Mode::kPrimary));
-  TF_ASSERT_OK_AND_ASSIGN(
-      const se::CommandBuffer::Command* cmd,
-      thunk.Record(execute_params, record_params,
-                   Command::RecordCreate{/*dependencies=*/{}},
-                   command_buffer.get()));
+  ASSERT_OK_AND_ASSIGN(const se::CommandBuffer::Command* cmd,
+                       thunk.Record(execute_params, record_params,
+                                    Command::RecordCreate{/*dependencies=*/{}},
+                                    command_buffer.get()));
   ASSERT_NE(cmd, nullptr);
-  TF_ASSERT_OK(command_buffer->Finalize());
-  TF_ASSERT_OK(command_buffer->Submit(stream.get()));
+  ASSERT_OK(command_buffer->Finalize());
+  ASSERT_OK(command_buffer->Submit(stream.get()));
 
   uint32_t result = 0;
-  TF_ASSERT_OK(stream->Memcpy(&result, dest, sizeof(uint32_t)));
+  ASSERT_OK(stream->Memcpy(&result, dest, sizeof(uint32_t)));
   EXPECT_EQ(result, 1u);  // device 0 is replica 1
 }
 
 // Records into a command buffer, submits, then updates and re-submits.
 TEST(ReplicaIdThunkTest, RecordCommandBufferUpdate) {
   se::StreamExecutor* executor = GpuExecutor();
-  TF_ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
+  ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
 
   se::DeviceAddress<uint32_t> dest = executor->AllocateArray<uint32_t>(1, 0);
-  TF_ASSERT_OK(stream->MemZero(&dest, sizeof(uint32_t)));
+  ASSERT_OK(stream->MemZero(&dest, sizeof(uint32_t)));
 
   BufferAllocation alloc(/*index=*/0, sizeof(uint32_t), /*color=*/0);
   BufferAllocation::Slice slice(&alloc, 0, sizeof(uint32_t));
@@ -303,7 +301,7 @@ TEST(ReplicaIdThunkTest, RecordCommandBufferUpdate) {
   run_options.mutable_run_options()->set_gpu_executable_run_options(
       &gpu_options);
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       CollectiveParams collective_params,
       CollectiveParams::Create(run_options, /*async_streams=*/{},
                                LocalDeviceId(executor->device_ordinal())));
@@ -313,48 +311,47 @@ TEST(ReplicaIdThunkTest, RecordCommandBufferUpdate) {
   se::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations buffer_allocations({dest}, 0, &allocator);
 
-  Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
-      run_options, buffer_allocations, stream.get(),
-      /*command_buffer_trace_stream=*/nullptr, &collective_params,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &buffer_allocations, stream.get());
+  thunk_params.WithRunOptions(&run_options)
+      .WithCollectiveParams(&collective_params);
+  Thunk::ExecuteParams execute_params = thunk_params.ExecuteParams();
 
   CommandStateManager state;
   Command::RecordParams record_params = {state};
 
   // First recording: RecordCreate.
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto command_buffer,
       executor->CreateCommandBuffer(se::CommandBuffer::Mode::kPrimary));
-  TF_ASSERT_OK_AND_ASSIGN(
-      const se::CommandBuffer::Command* cmd,
-      thunk.Record(execute_params, record_params,
-                   Command::RecordCreate{/*dependencies=*/{}},
-                   command_buffer.get()));
+  ASSERT_OK_AND_ASSIGN(const se::CommandBuffer::Command* cmd,
+                       thunk.Record(execute_params, record_params,
+                                    Command::RecordCreate{/*dependencies=*/{}},
+                                    command_buffer.get()));
   ASSERT_NE(cmd, nullptr);
-  TF_ASSERT_OK(command_buffer->Finalize());
-  TF_ASSERT_OK(command_buffer->Submit(stream.get()));
+  ASSERT_OK(command_buffer->Finalize());
+  ASSERT_OK(command_buffer->Submit(stream.get()));
 
   // Transition to update state and re-record with RecordUpdate.
-  TF_ASSERT_OK(command_buffer->Update());
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK(command_buffer->Update());
+  ASSERT_OK_AND_ASSIGN(
       const se::CommandBuffer::Command* updated_cmd,
       thunk.Record(execute_params, record_params, Command::RecordUpdate{cmd},
                    command_buffer.get()));
   EXPECT_EQ(updated_cmd, cmd);  // same command node is reused
-  TF_ASSERT_OK(command_buffer->Finalize());
-  TF_ASSERT_OK(command_buffer->Submit(stream.get()));
+  ASSERT_OK(command_buffer->Finalize());
+  ASSERT_OK(command_buffer->Submit(stream.get()));
 
   uint32_t result = 0;
-  TF_ASSERT_OK(stream->Memcpy(&result, dest, sizeof(uint32_t)));
+  ASSERT_OK(stream->Memcpy(&result, dest, sizeof(uint32_t)));
   EXPECT_EQ(result, 1u);  // device 0 is replica 1
 }
 
 TEST(PartitionIdThunkTest, RecordCommandBuffer) {
   se::StreamExecutor* executor = GpuExecutor();
-  TF_ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
+  ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
 
   se::DeviceAddress<uint32_t> dest = executor->AllocateArray<uint32_t>(1, 0);
-  TF_ASSERT_OK(stream->MemZero(&dest, sizeof(uint32_t)));
+  ASSERT_OK(stream->MemZero(&dest, sizeof(uint32_t)));
 
   BufferAllocation alloc(/*index=*/0, sizeof(uint32_t), /*color=*/0);
   BufferAllocation::Slice slice(&alloc, 0, sizeof(uint32_t));
@@ -374,7 +371,7 @@ TEST(PartitionIdThunkTest, RecordCommandBuffer) {
   run_options.mutable_run_options()->set_gpu_executable_run_options(
       &gpu_options);
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       CollectiveParams collective_params,
       CollectiveParams::Create(run_options, /*async_streams=*/{},
                                LocalDeviceId(executor->device_ordinal())));
@@ -384,28 +381,27 @@ TEST(PartitionIdThunkTest, RecordCommandBuffer) {
   se::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations buffer_allocations({dest}, 0, &allocator);
 
-  Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
-      run_options, buffer_allocations, stream.get(),
-      /*command_buffer_trace_stream=*/nullptr, &collective_params,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &buffer_allocations, stream.get());
+  thunk_params.WithRunOptions(&run_options)
+      .WithCollectiveParams(&collective_params);
+  Thunk::ExecuteParams execute_params = thunk_params.ExecuteParams();
 
   CommandStateManager state;
   Command::RecordParams record_params = {state};
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto command_buffer,
       executor->CreateCommandBuffer(se::CommandBuffer::Mode::kPrimary));
-  TF_ASSERT_OK_AND_ASSIGN(
-      const se::CommandBuffer::Command* cmd,
-      thunk.Record(execute_params, record_params,
-                   Command::RecordCreate{/*dependencies=*/{}},
-                   command_buffer.get()));
+  ASSERT_OK_AND_ASSIGN(const se::CommandBuffer::Command* cmd,
+                       thunk.Record(execute_params, record_params,
+                                    Command::RecordCreate{/*dependencies=*/{}},
+                                    command_buffer.get()));
   ASSERT_NE(cmd, nullptr);
-  TF_ASSERT_OK(command_buffer->Finalize());
-  TF_ASSERT_OK(command_buffer->Submit(stream.get()));
+  ASSERT_OK(command_buffer->Finalize());
+  ASSERT_OK(command_buffer->Submit(stream.get()));
 
   uint32_t result = 0;
-  TF_ASSERT_OK(stream->Memcpy(&result, dest, sizeof(uint32_t)));
+  ASSERT_OK(stream->Memcpy(&result, dest, sizeof(uint32_t)));
   EXPECT_EQ(result, 1u);  // device 0 is partition 1
 }
 

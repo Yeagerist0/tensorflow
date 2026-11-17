@@ -35,7 +35,6 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "xla/python/ifrt/device_list.h"
 #include "xla/python/ifrt/index_domain.h"
-#include "xla/python/ifrt/ir/sharding_param.h"
 #include "xla/python/ifrt/memory.h"
 #include "xla/python/ifrt/rtti.h"
 #include "xla/python/ifrt/serdes.h"
@@ -73,7 +72,7 @@ using ShardingSpecRef = absl_nonnull std::shared_ptr<const ShardingSpec>;
 class ShardingSpec : public RTTIExtends<ShardingSpec, Serializable>,
                      public std::enable_shared_from_this<ShardingSpec> {
  public:
-  // Returns the number of shards.
+  // Returns the number of shards. Guaranteed to be >= 1.
   int num_shards() const { return num_shards_; }
 
   // Returns if this sharding spec is fully replicated. A fully replicated
@@ -271,7 +270,13 @@ class SingleDeviceShardingSpec final
 class OpaqueShardingSpec
     : public RTTIExtends<OpaqueShardingSpec, ShardingSpec> {
  public:
+  // Creates an opaque sharding spec. Returns `InvalidArgumentError` if
+  // `num_shards < 1`.
+  static absl::StatusOr<std::unique_ptr<OpaqueShardingSpec>> CreateIfValid(
+      int num_shards);
+
   // Creates an opaque sharding spec. `Disassemble()` will fail.
+  // REQUIRES: `num_shards >= 1`.
   static std::unique_ptr<OpaqueShardingSpec> Create(int num_shards);
 
   // ShardingSpec implementation.
@@ -319,26 +324,41 @@ class ConcreteShardingSpec
     : public RTTIExtends<ConcreteShardingSpec, ShardingSpec> {
  public:
   // Creates a concrete sharding spec that may contain non-identical shard
+  // shapes. Returns `InvalidArgumentError` if `shard_shapes` is empty or
+  // exceeds `INT_MAX`.
+  static absl::StatusOr<std::unique_ptr<ConcreteShardingSpec>> CreateIfValid(
+      Shape shape, std::vector<Shape> shard_shapes,
+      std::optional<std::vector<xla::ifrt::IndexDomain>> index_domains);
+
+  // Creates a concrete sharding spec that may contain non-identical shard
   // shapes.
+  // REQUIRES: `!shard_shapes.empty()` and `shard_shapes.size() <= INT_MAX`.
   static std::unique_ptr<ConcreteShardingSpec> Create(
       Shape shape, std::vector<Shape> shard_shapes,
       std::optional<std::vector<xla::ifrt::IndexDomain>> index_domains =
           std::nullopt);
 
   // Creates a concrete sharding spec that may contain non-identical shard
+  // dynamic shapes. Returns `InvalidArgumentError` if `shard_dynamic_shapes`
+  // is empty or exceeds `INT_MAX`.
+  static absl::StatusOr<std::unique_ptr<ConcreteShardingSpec>> CreateIfValid(
+      DynamicShape dynamic_shape,
+      std::vector<DynamicShape> shard_dynamic_shapes);
+
+  // Creates a concrete sharding spec that may contain non-identical shard
   // dynamic shapes.
+  // REQUIRES: `!shard_dynamic_shapes.empty()` and
+  // `shard_dynamic_shapes.size() <= INT_MAX`.
   static std::unique_ptr<ConcreteShardingSpec> Create(
       DynamicShape dynamic_shape,
       std::vector<DynamicShape> shard_dynamic_shapes);
 
   bool has_dynamic_shape() const {
-    DCHECK(this);
     return std::holds_alternative<DynamicShape>(shape_) &&
            std::holds_alternative<std::vector<DynamicShape>>(shard_shapes_);
   }
 
   bool has_static_shape() const {
-    DCHECK(this);
     return std::holds_alternative<Shape>(shape_) &&
            std::holds_alternative<std::vector<Shape>>(shard_shapes_);
   }
@@ -354,13 +374,11 @@ class ConcreteShardingSpec
   }
 
   const std::vector<Shape>& shard_shapes() const {
-    DCHECK(this);
     DCHECK(std::holds_alternative<std::vector<Shape>>(shard_shapes_));
     return std::get<std::vector<Shape>>(shard_shapes_);
   }
 
   const std::vector<DynamicShape>& shard_dynamic_shapes() const {
-    DCHECK(this);
     DCHECK(std::holds_alternative<std::vector<DynamicShape>>(shard_shapes_));
     return std::get<std::vector<DynamicShape>>(shard_shapes_);
   }
@@ -401,6 +419,8 @@ class ConcreteShardingSpec
   ConcreteShardingSpec(const ConcreteShardingSpec& other);
 
  private:
+  friend class ConcreteSharding;
+
   ConcreteShardingSpec(
       int num_shards, Shape shape, std::vector<Shape> shard_shapes,
       std::optional<std::vector<xla::ifrt::IndexDomain>> index_domains);
@@ -430,19 +450,24 @@ class ConcreteShardingSpec
 class ConcreteEvenShardingSpec
     : public RTTIExtends<ConcreteEvenShardingSpec, ShardingSpec> {
  public:
+  // Creates a concrete even sharding spec. Returns `InvalidArgumentError` if
+  // `num_shards < 1`.
+  static absl::StatusOr<std::unique_ptr<ConcreteEvenShardingSpec>>
+  CreateIfValid(int num_shards, Shape shape, Shape shard_shape,
+                bool is_fully_replicated);
+
   // Creates a concrete even sharding spec.
   // TODO(hyeontaek): Remove the default value of `is_fully_replicated` once all
   // callers are updated to provide it explicitly.
+  // REQUIRES: `num_shards >= 1`.
   static std::unique_ptr<ConcreteEvenShardingSpec> Create(
       int num_shards, Shape shape, Shape shard_shape,
       bool is_fully_replicated = false);
 
   Shape shape() const {
-    DCHECK(this);
     return shape_;
   }
   const Shape& shard_shape() const {
-    DCHECK(this);
     return shard_shape_;
   }
 
@@ -491,57 +516,6 @@ class ConcreteEvenShardingSpec
   mutable std::vector<int> cached_shard_indices_;
   mutable absl::once_flag shard_to_unique_index_domain_index_once_;
   mutable std::vector<int> cached_shard_to_unique_index_domain_index_;
-};
-
-// Sharding spec derived from an IR ShardingParam.
-class ShardingParamShardingSpec
-    : public RTTIExtends<ShardingParamShardingSpec, ShardingSpec> {
- public:
-  static std::unique_ptr<ShardingParamShardingSpec> Create(
-      ShardingParam sharding_param);
-
-  const ShardingParam& sharding_param() const { return sharding_param_; }
-
-  absl::StatusOr<ShardingRef> ToSharding(DeviceListRef devices,
-                                         MemoryKind memory_kind) const override;
-
-  absl::StatusOr<Shape> GetShardShape(const Shape& shape) const override;
-
-  bool HasSamePartitioning(const ShardingSpec& other) const override;
-
-  absl::StatusOr<std::vector<std::pair<Shape, ShardingSpecRef>>> Disassemble(
-      const Shape& shape) const override;
-
-  absl::StatusOr<std::vector<std::pair<DynamicShape, ShardingSpecRef>>>
-  Disassemble(const DynamicShape& dynamic_shape) const override;
-
-  absl::StatusOr<std::vector<IndexDomain>> IndexDomains(
-      const Shape& shape) const override;
-
-  absl::StatusOr<absl::InlinedVector<IndexDomainAndShardIndices, 1>>
-  UniqueIndexDomains(const Shape& shape) const override;
-
-  absl::StatusOr<absl::Span<const int>> ShardToUniqueIndexDomainIndex()
-      const override;
-
-  static char ID;  // NOLINT
-
-  ShardingParamShardingSpec(const ShardingParamShardingSpec& other);
-
- private:
-  ShardingParamShardingSpec(int num_shards, ShardingParam sharding_param);
-
-  std::string DebugString() const override;
-
-  void Hash(absl::HashState state) const override;
-
-  ShardingParam sharding_param_;
-
-  mutable absl::once_flag unique_shard_indices_once_;
-  mutable absl::StatusOr<std::vector<int>> cached_shard_indices_;
-  mutable absl::once_flag shard_to_unique_index_domain_index_once_;
-  mutable absl::StatusOr<std::vector<int>>
-      cached_shard_to_unique_index_domain_index_;
 };
 
 }  // namespace ifrt

@@ -20,6 +20,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/base/no_destructor.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/inlined_vector.h"
@@ -35,12 +36,15 @@ limitations under the License.
 #include "xla/hlo/analysis/hlo_alias_analysis.h"
 #include "xla/hlo/analysis/hlo_dataflow_analysis.h"
 #include "xla/hlo/analysis/hlo_ordering.h"
+#include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/buffer_value.h"
 #include "xla/service/collective_ops_utils.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/hlo_buffer.h"
 #include "xla/service/hlo_value.h"
 #include "xla/shape_util.h"
@@ -117,6 +121,13 @@ ParseIndexMemorySpacePairs(absl::string_view str) {
   return result;
 }
 
+// Only the dynamic-slice rewriter remaps these index-based annotations when
+// forming a fusion. Other fusion kinds must not consume inherited annotations.
+static bool SupportsMemorySpaceAnnotations(const HloInstruction* inst) {
+  return inst->opcode() == HloOpcode::kCustomCall ||
+         GetCustomFusionConfigName(inst) == kDynamicSliceFusionConfigName;
+}
+
 // Returns true if the instruction's collectives mode requires symmetric
 // (collective) memory. Device-initiated and one-sided collectives need all
 // buffers registered with the collective runtime ahead of time.
@@ -149,44 +160,11 @@ bool IsNcclSymmetricOrUserBuffersEnabledForInstruction(
          IsNcclSymmetricBuffersEnabledForCollective(inst, option);
 }
 
-bool HasCollectiveMemoryInstruction(const HloValue& input_alias,
-                                    const DebugOptions& option) {
-  // Tuple-shaped values are pointer containers and never hold data that needs
-  // to live in collective memory. Only array sub-elements do.
-  if (input_alias.shape().IsTuple()) {
-    return false;
-  }
-  // If any use is a collective instruction, we must color the value to use
-  // collective memory space.
-  for (const HloUse& use : input_alias.GetUses()) {
-    if (IsNcclSymmetricOrUserBuffersEnabledForInstruction(use.instruction,
-                                                          option)) {
-      return true;
-    }
-  }
-  return IsNcclSymmetricOrUserBuffersEnabledForInstruction(
-      input_alias.instruction(), option);
-}
-
-bool HasSymmetricMemoryInstruction(const HloValue& input_alias) {
-  // Tuple-shaped values are pointer containers and never hold data that needs
-  // to live in collective memory. Only array sub-elements do.
-  if (input_alias.shape().IsTuple()) {
-    return false;
-  }
-  for (const HloUse& use : input_alias.GetUses()) {
-    if (RequiresCollectiveSymmetricMemorySpace(use.instruction)) {
-      return true;
-    }
-  }
-  return RequiresCollectiveSymmetricMemorySpace(input_alias.instruction());
-}
-
-// Returns the memory space requested for the given custom call use, or
+// Returns the memory space requested for the given operand use, or
 // MemorySpaceColor::kDefault if none is specified.
-static absl::StatusOr<MemorySpaceColor> GetCustomCallOperandMemorySpace(
+static absl::StatusOr<MemorySpaceColor> GetOperandMemorySpace(
     const HloUse& use) {
-  if (use.instruction->opcode() != HloOpcode::kCustomCall ||
+  if (!SupportsMemorySpaceAnnotations(use.instruction) ||
       !use.operand_index.empty()) {
     return MemorySpaceColor::kDefault;
   }
@@ -207,35 +185,12 @@ static absl::StatusOr<MemorySpaceColor> GetCustomCallOperandMemorySpace(
   return MemorySpaceColor::kDefault;
 }
 
-// Returns true if the value is
-// 1. Used by a RaggedAllToAll as Operand(1)
-// 2. RaggedAllToAll result
-bool IsRaggedAllToAllCollectiveOperandOrResult(const HloValue& value) {
-  if (value.shape().IsTuple()) {
-    return false;
-  }
-
-  // Check if the value is DEFINED by an RA2A (the result)
-  if (IsRaggedAllToAllOrAsyncDoneRaggedAllToAll(value.defining_instruction())) {
-    return true;
-  }
-
-  // Check if the value is USED by an RA2A as the destination (Operand 1)
-  for (const HloUse& use : value.GetUses()) {
-    if (IsRaggedAllToAllOrAsyncStartRaggedAllToAll(use.instruction) &&
-        use.operand_number == 1) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// Returns the memory space requested for a custom call result value, or
+// Returns the memory space requested for an instruction result value, or
 // MemorySpaceColor::kDefault if none is specified.
-static absl::StatusOr<MemorySpaceColor> GetCustomCallResultMemorySpace(
+static absl::StatusOr<MemorySpaceColor> GetResultMemorySpace(
     const HloValue& value) {
   const HloInstruction* instr = value.instruction();
-  if (instr->opcode() != HloOpcode::kCustomCall) {
+  if (!SupportsMemorySpaceAnnotations(instr)) {
     return MemorySpaceColor::kDefault;
   }
 
@@ -256,13 +211,85 @@ static absl::StatusOr<MemorySpaceColor> GetCustomCallResultMemorySpace(
   return MemorySpaceColor::kDefault;
 }
 
+bool RequiresCollectiveInput(const HloUse& use, const DebugOptions& option) {
+  const HloInstruction* user = use.instruction;
+  if (ShapeUtil::GetSubshape(user->operand(use.operand_number)->shape(),
+                             use.operand_index)
+          .IsTuple()) {
+    return false;
+  }
+
+  // Handle standard collectives under NCCL user/symmetric buffers, or
+  // device-initiated/one-sided collectives requiring symmetric memory.
+  if (IsNcclSymmetricOrUserBuffersEnabledForInstruction(user, option) ||
+      RequiresCollectiveSymmetricMemorySpace(user)) {
+    return true;
+  }
+
+  // Handle one-shot RaggedAllToAll with NCCL enabled: operand 1 (the output
+  // buffer) requires collective memory.
+  if (IsOneShotRaggedAllToAllWithNcclEnabled(option) &&
+      IsRaggedAllToAllOrAsyncStartRaggedAllToAll(user) &&
+      use.operand_number == 1) {
+    return true;
+  }
+
+  // Check custom calls and dynamic-slice fusions with memory-space annotations.
+  absl::StatusOr<MemorySpaceColor> operand_ms = GetOperandMemorySpace(use);
+  return operand_ms.ok() && *operand_ms == MemorySpaceColor::kCollective;
+}
+
+bool RequiresCollectiveOutput(const HloValue& value,
+                              const DebugOptions& option) {
+  // Tuple-shaped values are pointer containers and never hold data that needs
+  // to live in collective memory. Only array sub-elements do.
+  if (value.shape().IsTuple()) {
+    return false;
+  }
+
+  const HloInstruction* def = value.defining_instruction();
+
+  // Handle standard collectives under NCCL user/symmetric buffers, or
+  // device-initiated/one-sided collectives requiring symmetric memory.
+  if (IsNcclSymmetricOrUserBuffersEnabledForInstruction(def, option) ||
+      RequiresCollectiveSymmetricMemorySpace(def)) {
+    return true;
+  }
+
+  // Handle one-shot RaggedAllToAll with NCCL enabled.
+  if (IsOneShotRaggedAllToAllWithNcclEnabled(option) &&
+      IsRaggedAllToAllOrAsyncDoneRaggedAllToAll(def)) {
+    return true;
+  }
+
+  // Check custom calls and dynamic-slice fusions with memory-space annotations.
+  absl::StatusOr<MemorySpaceColor> result_ms = GetResultMemorySpace(value);
+  return result_ms.ok() && *result_ms == MemorySpaceColor::kCollective;
+}
+
 namespace {
+
+bool HasCollectiveMemoryInstruction(const HloValue& input_alias,
+                                    const DebugOptions& option) {
+  // Tuple-shaped values are pointer containers and never hold data that needs
+  // to live in collective memory. Only array sub-elements do.
+  if (input_alias.shape().IsTuple()) {
+    return false;
+  }
+  if (RequiresCollectiveOutput(input_alias, option)) {
+    return true;
+  }
+  for (const HloUse& use : input_alias.GetUses()) {
+    if (RequiresCollectiveInput(use, option)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Determines the memory space color for the given HLO buffer
 absl::StatusOr<BufferValue::Color> DetermineBufferColor(
     const HloBuffer& buffer, const DebugOptions& option) {
-  // Is one-shot RaggedAllToAll with NCCL feature is enabled.
-  const bool is_one_shot_ra2a_with_nccl =
-      IsOneShotRaggedAllToAllWithNcclEnabled(option);
   // Collect Color Candidates
   absl::InlinedVector<BufferValue::Color, 4> candidates;
   for (const HloValue* value : buffer.values()) {
@@ -284,36 +311,22 @@ absl::StatusOr<BufferValue::Color> DetermineBufferColor(
       }
     }
 
-    // Check if this value is a custom call result with a requested memory
-    // space.
-    ABSL_ASSIGN_OR_RETURN(MemorySpaceColor result_ms,
-                     GetCustomCallResultMemorySpace(*value));
+    // Check if this value has a requested result memory space.
+    ABSL_ASSIGN_OR_RETURN(MemorySpaceColor result_ms, GetResultMemorySpace(*value));
     if (result_ms != MemorySpaceColor::kDefault) {
       candidates.push_back(static_cast<BufferValue::Color>(result_ms));
     }
 
-    // Check if any use of this alias is a custom call operand with a
-    // requested memory space.
+    // Check if any use of this alias has a requested operand memory space.
     for (const HloUse& use : value->GetUses()) {
-      ABSL_ASSIGN_OR_RETURN(MemorySpaceColor operand_ms,
-                       GetCustomCallOperandMemorySpace(use));
+      ABSL_ASSIGN_OR_RETURN(MemorySpaceColor operand_ms, GetOperandMemorySpace(use));
       if (operand_ms != MemorySpaceColor::kDefault) {
         candidates.push_back(static_cast<BufferValue::Color>(operand_ms));
       }
     }
 
     // Collective Candidates
-    if (is_one_shot_ra2a_with_nccl &&
-        IsRaggedAllToAllCollectiveOperandOrResult(*value)) {
-      // One-shot RaggedAllToAll with NCCL requires collective memory for
-      // both operand 1 and the result.
-      candidates.push_back(
-          static_cast<BufferValue::Color>(MemorySpaceColor::kCollective));
-    } else if (HasSymmetricMemoryInstruction(*value)) {
-      // Device-initiated and one-sided collectives require symmetric memory.
-      candidates.push_back(
-          static_cast<BufferValue::Color>(MemorySpaceColor::kCollective));
-    } else if (HasCollectiveMemoryInstruction(*value, option)) {
+    if (HasCollectiveMemoryInstruction(*value, option)) {
       candidates.push_back(
           static_cast<BufferValue::Color>(MemorySpaceColor::kCollective));
     }
@@ -361,4 +374,102 @@ BufferAssigner::Colorer CreateColorer(const DebugOptions& option) {
     return AssignColors(option, alias_analysis);
   };
 }
+
+namespace {
+
+// nullopt means all collective types are enabled.
+using CollectiveOpTypes =
+    std::optional<absl::flat_hash_set<DebugOptions::CollectiveOpType>>;
+
+CollectiveOpTypes GetEnabledCollectiveOpTypes(const DebugOptions& option) {
+  const auto& filter =
+      option.xla_gpu_enable_collectives_command_buffer_filter();
+  if (filter.empty() ||
+      absl::c_linear_search(filter, DebugOptions::ALLCOLLECTIVES)) {
+    return std::nullopt;
+  }
+  absl::flat_hash_set<DebugOptions::CollectiveOpType> enabled;
+  for (int type : filter) {
+    enabled.insert(static_cast<DebugOptions::CollectiveOpType>(type));
+  }
+  return enabled;
+}
+
+// Collective groups are matched through the collectives they wrap.
+bool IsCommandBufferCollective(const HloInstruction* instruction,
+                               const CollectiveOpTypes& enabled) {
+  switch (instruction->opcode()) {
+    // The filter has no type for send and recv. Host transfers lower to host
+    // send/recv thunks, which are never recorded.
+    case HloOpcode::kRecv:
+    case HloOpcode::kRecvDone:
+    case HloOpcode::kSend:
+    case HloOpcode::kSendDone:
+      return !Cast<HloSendRecvInstruction>(instruction)->is_host_transfer();
+    default:
+      break;
+  }
+  std::optional<DebugOptions::CollectiveOpType> type =
+      GetCollectiveOpType(instruction);
+  return type.has_value() && (!enabled.has_value() || enabled->contains(*type));
+}
+
+bool IsCommandBufferCollectiveValue(const HloAliasAnalysis& alias_analysis,
+                                    const HloValue& value,
+                                    const CollectiveOpTypes& enabled) {
+  if (value.shape().IsTuple() || alias_analysis.ValueLivesOut(value)) {
+    return false;
+  }
+  if (IsCommandBufferCollective(value.instruction(), enabled)) {
+    return true;
+  }
+  return absl::c_any_of(value.GetUses(), [&](const HloUse& use) {
+    return IsCommandBufferCollective(use.instruction, enabled);
+  });
+}
+
+}  // namespace
+
+std::optional<BufferAssigner::MustNotLiveOut> CreateMustNotLiveOut(
+    const DebugOptions& option) {
+  // Only the VA remapping modes keep the temp allocation at a stable address.
+  const DebugOptions::CommandBufferUpdateMode update_mode =
+      option.xla_gpu_command_buffer_update_mode();
+  // TODO(magaonka-amd): Account for ragged all-to-all, which the command
+  // buffer conversion pass records as COLLECTIVES_KERNEL when it uses the
+  // symmetric memory kernel.
+  if (!option.xla_gpu_command_buffer_keep_collectives_out_of_outputs() ||
+      (update_mode != DebugOptions::SKIP_TEMP &&
+       update_mode != DebugOptions::SKIP_PROFILED) ||
+      !absl::c_linear_search(option.xla_gpu_enable_command_buffer(),
+                             DebugOptions::COLLECTIVES)) {
+    return std::nullopt;
+  }
+  return [enabled = GetEnabledCollectiveOpTypes(option)](
+             const HloAliasAnalysis& alias_analysis,
+             const HloInstruction* instruction, const ShapeIndex& index) {
+    const HloValueSet& value_set =
+        alias_analysis.dataflow_analysis().GetValueSet(instruction, index);
+    return absl::c_any_of(value_set.values(), [&](const HloValue* value) {
+      return IsCommandBufferCollectiveValue(alias_analysis, *value, enabled);
+    });
+  };
+}
+
+BufferAssigner::Options CreateBufferAssignerOptions(
+    const DebugOptions& option) {
+  BufferAssigner::Options opts;
+  opts.colorer = CreateColorer(option);
+  opts.must_not_live_out = CreateMustNotLiveOut(option);
+
+  // Allow S(0) buffers to reuse S(1) temp allocations. S(1) allocations
+  // satisfy stricter alignment and symmetric-offset requirements, so they are
+  // valid storage for S(0) buffers. Keep this directional: S(1) buffers must
+  // not be assigned to S(0) allocations.
+  opts.can_use_allocation = BufferAssigner::AllowCrossColorReuse(
+      static_cast<int>(MemorySpaceColor::kDefault),
+      static_cast<int>(MemorySpaceColor::kCollective));
+  return opts;
+}
+
 }  // namespace xla::gpu

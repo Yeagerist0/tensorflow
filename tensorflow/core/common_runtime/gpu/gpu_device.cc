@@ -18,7 +18,6 @@ limitations under the License.
 #if (defined(GOOGLE_CUDA) && GOOGLE_CUDA) || \
     (defined(TENSORFLOW_USE_ROCM) && TENSORFLOW_USE_ROCM)
 
-
 #if TENSORFLOW_USE_ROCM
 #include "rocm/include/hip/hip_runtime.h"
 #endif
@@ -67,12 +66,14 @@ limitations under the License.
 #include "tensorflow/core/lib/strings/numbers.h"
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/lib/strings/strcat.h"
+#include "tensorflow/core/tfrt/common/global_state.h"
 #if GOOGLE_CUDA
 #include "third_party/gpus/cudnn/cudnn.h"
 #elif TENSORFLOW_USE_ROCM
 #include "tensorflow/core/platform/rocm.h"
 #endif
 #include "tensorflow/compiler/jit/flags.h"
+#include "xla/client/client_library.h"
 #include "xla/pjrt/gpu/gpu_helpers.h"
 #include "xla/pjrt/gpu/se_gpu_pjrt_client.h"
 #include "xla/pjrt/host_memory_allocator.h"
@@ -156,7 +157,7 @@ class EigenGpuStreamDevice : public ::Eigen::StreamInterface {
         semaphore_(nullptr),
         context_(nullptr),
         device_(this) {}
-  ~EigenGpuStreamDevice() override {}
+  ~EigenGpuStreamDevice() override = default;
 
   void Reinitialize(OpKernelContext* context, gpuStream_t gpu_stream,
                     tsl::PlatformDeviceId platform_device_id,
@@ -184,8 +185,8 @@ class EigenGpuStreamDevice : public ::Eigen::StreamInterface {
     if (ret == nullptr) {
       if (context_) {
         context_->SetStatus(absl::ResourceExhaustedError(
-            strings::StrCat("Ran out of GPU memory when allocating ", num_bytes,
-                            " bytes for ", operation_)));
+            absl::StrCat("Ran out of GPU memory when allocating ", num_bytes,
+                         " bytes for ", operation_)));
       } else {
         LOG(FATAL)
             << "EigenAllocator for GPU ran out of memory when allocating "
@@ -433,6 +434,7 @@ absl::Status BaseGPUDevice::Init(
   if (!emplace_result.second) {
     LOG(WARNING) << "StreamGroup for tf_device_id: " << tf_device_id_.value()
                  << " already exists. This usually only happens in unit tests.";
+    *emplace_result.first = stream_group;
   }
   stream_ = emplace_result.first;
 
@@ -482,9 +484,11 @@ absl::Status BaseGPUDevice::Init(
   accelerator_device_info_->stream = stream_->compute;
   accelerator_device_info_->default_context = device_context_;
   accelerator_device_info_->pjrt_context = pjrt_device_context_.get();
+  bool use_pjrt =
+      GetXlaOpsCommonFlags()->tf_xla_use_device_api.IsEnabledForGpu();
   accelerator_device_info_->use_pjrt_tensor_buffer =
-      static_cast<PjRtDeviceContext*>(pjrt_device_context_.get())
-          ->use_pjrt_tensor_buffer();
+      use_pjrt && static_cast<PjRtDeviceContext*>(pjrt_device_context_.get())
+                      ->use_pjrt_tensor_buffer();
   accelerator_device_info_->event_mgr = em_;
   tsl::PlatformDeviceId platform_device_id;
   TF_RETURN_IF_ERROR(
@@ -549,7 +553,7 @@ absl::Status BaseGPUDevice::Init(
 }
 
 std::string BaseGPUDevice::ComputeOpKernelDebugString(const OpKernel& op_kernel,
-                                                      const int& stream_id) {
+                                                      const int stream_id) {
   return strings::StrCat(op_kernel.name(), " op ", op_kernel.type_string(),
                          " on GPU ", tf_device_id_.value(), " stream[",
                          stream_id, "]");
@@ -588,13 +592,12 @@ bool ShouldLogInputsAndOutputs(OpKernel* op_kernel) {
 Tensor BaseGPUDevice::CopyGpuTensorToHostDebugOnly(const Tensor& gpu_tensor) {
   Tensor host_tensor(gpu_tensor.dtype(), gpu_tensor.shape());
   auto stream = device_context_->stream();
-  CHECK(stream  // Crash OK
-            ->Memcpy(host_tensor.data(),
-                     stream_executor::DeviceAddressBase(
-                         gpu_tensor.data(), gpu_tensor.TotalBytes()),
-                     gpu_tensor.TotalBytes())
-            .ok());
-  CHECK(stream->BlockHostUntilDone().ok());  // Crash OK
+  CHECK_OK(stream  // Crash OK
+               ->Memcpy(host_tensor.data(),
+                        stream_executor::DeviceAddressBase(
+                            gpu_tensor.data(), gpu_tensor.TotalBytes()),
+                        gpu_tensor.TotalBytes()));
+  CHECK_OK(stream->BlockHostUntilDone());  // Crash OK
   return host_tensor;
 }
 
@@ -665,7 +668,7 @@ void BaseGPUDevice::Compute(OpKernel* op_kernel, OpKernelContext* context) {
             << ComputeOpKernelDebugString(*op_kernel, stream_id);
   }
 
-  if (kernel_tracker_.get()) {
+  if (kernel_tracker_) {
     context->set_record_memory_consumption(true);
     if (pending_cap_ > 0) {
       kernel_tracker_->PauseWhilePendingExceeds(pending_cap_);
@@ -1729,9 +1732,10 @@ absl::Status BaseGPUDeviceFactory::CreateDevices(
       VLOG(3) << "should_create_new_pjrt_client="
               << should_create_new_pjrt_client << " for device ordinal " << di
               << ". Re-using local_device_state";
-      auto* pjrt_se_client = absl::down_cast<xla::PjRtStreamExecutorRawClient*>(
+      auto* pjrt_se_client =
           absl::down_cast<xla::CommonPjRtClient*>(*obtained_pjrt_client)
-              ->raw_client());
+              ->raw_client()
+              ->down_cast<xla::PjRtStreamExecutorRawClient>();
       local_device_state = pjrt_se_client->device_state(xla::LocalDeviceId(di));
       if (!local_device_state) {
         return absl::InternalError(absl::StrCat(
@@ -2352,6 +2356,31 @@ int BaseGPUDevice::PendingKernels() {
 
 void BaseGPUDevice::TestOnlyReset() {
   StreamGroupFactory::Global().TestOnlyReset();
+  // CreateDevices() builds the GPU devices' streams on a process-global PjRt
+  // GPU client, which in turn is built on the process-global XLA LocalClient
+  // for the GPU platform. Both are only rebuilt when their cached state does
+  // not match (and the LocalClient never is), so a test that changes the GPU
+  // device configuration would otherwise reuse state built for the previous
+  // configuration.
+  //
+  // Retire the PjRt GPU client. It is moved to PjRtState's unused list rather
+  // than destroyed, so buffers and executables that still refer to it stay
+  // valid; it is never used for new work.
+  ResourceMgr* rmgr = tfrt_global::GetTFGlobalResourceMgr();
+  PjRtState* pjrt_state = nullptr;
+  if (rmgr->Lookup(rmgr->default_container(), kPjRtStateResourceName,
+                   &pjrt_state)
+          .ok()) {
+    core::ScopedUnref pjrt_state_ref(pjrt_state);
+    // NOT_FOUND just means no GPU client was created.
+    pjrt_state->MovePjRtClientToUnused(DeviceType(DEVICE_GPU)).IgnoreError();
+  }
+  // Destroy the GPU platform's LocalClient so the next CreateDevices() creates
+  // it with the new allowed (visible) devices. Must happen after the PjRt
+  // client is retired. Callers must ensure no session that uses a GPU device
+  // (and therefore may hold the LocalClient, e.g. via an XLA compilation
+  // cache) is still alive.
+  xla::ClientLibrary::DestroyLocalInstance(se::GPUMachineManager());
 }
 
 uint64_t GPUKernelTracker::MaybeQueue(OpKernelContext* ctx) {

@@ -154,6 +154,10 @@ absl::StatusOr<HloInstruction*> ChooseIdentityValue(HloInstruction* inst,
     case HloOpcode::kDynamicUpdateSlice:
     case HloOpcode::kGetDimensionSize:
     case HloOpcode::kSetDimensionSize:
+    // Bit-width-changing bitcast-converts are not elementwise, but padding
+    // data reinterprets to padding data; the minor dimension they add or
+    // remove is static (shape inference rejects a dynamic one).
+    case HloOpcode::kBitcastConvert:
     case HloOpcode::kConcatenate:
     case HloOpcode::kReshape:
     case HloOpcode::kReverse:
@@ -164,7 +168,6 @@ absl::StatusOr<HloInstruction*> ChooseIdentityValue(HloInstruction* inst,
     case HloOpcode::kTranspose:
     case HloOpcode::kSort:
     case HloOpcode::kSlice:
-    case HloOpcode::kDomain:
     case HloOpcode::kOptimizationBarrier:
       return nullptr;
     case HloOpcode::kCustomCall:
@@ -219,7 +222,7 @@ absl::StatusOr<bool> ReplaceSetSize(HloInstruction* instr) {
     return false;
   }
 
-  TF_RET_CHECK(Shape::Equal().IgnoreDynamicDimension()(
+  TF_RET_CHECK(Shape::Equal().IgnoreDynamicDimension().IgnoreLayout()(
       instr->shape(), instr->operand(0)->shape()))
       << "instr->shape() " << instr->shape().ToString() << " , "
       << "instruction operand shape " << instr->operand(0)->shape();
@@ -235,7 +238,7 @@ absl::StatusOr<bool> ReplaceSetBound(HloInstruction* instr) {
     return false;
   }
 
-  TF_RET_CHECK(Shape::Equal().IgnoreDynamicDimension()(
+  TF_RET_CHECK(Shape::Equal().IgnoreDynamicDimension().IgnoreLayout()(
       instr->shape(), instr->operand(0)->shape()))
       << "instr->shape() " << instr->shape().ToString() << " , "
       << "instruction operand shape " << instr->operand(0)->shape();
@@ -1499,6 +1502,14 @@ absl::StatusOr<bool> RewriteDynamicBinaryOp(
 
     if (dims_0[i] != dims_1[i] && dims_0[i] != nullptr &&
         dims_1[i] != nullptr) {
+      // A dynamic dimension whose static bound is zero can only have a dynamic
+      // size of zero, so both operands are always empty along this dimension
+      // and there is no implicit broadcast to insert. The rewrite below slices
+      // a size-1 window along the dimension, which would be out of bounds for
+      // an empty dimension (https://github.com/openxla/xla/issues/49925).
+      if (operand_0->shape().dimensions(i) == 0) {
+        continue;
+      }
       changed = true;
       // It is possible that a dynamic dimension of one operand is size 1 while
       // the other is greater than one. According to implicit broadcast
@@ -1974,6 +1985,18 @@ absl::StatusOr<HloInstruction*> DynamicShapeRemovingVisitor::ConvertToDynamic(
       if (dimension_size == nullptr) {
         dimension_size = inst->AddInstruction(HloInstruction::CreateConstant(
             LiteralUtil::CreateR0<int32_t>(subshape.dimensions(i))));
+      } else {
+        // Clamp the size to [0, bound]: nothing validates the size operand
+        // of set-dimension-size, and SliceToDynamic uses it as an unchecked
+        // copy bound.
+        HloInstruction* zero = inst->AddInstruction(
+            HloInstruction::CreateConstant(LiteralUtil::CreateR0<int32_t>(0)));
+        HloInstruction* bound =
+            inst->AddInstruction(HloInstruction::CreateConstant(
+                LiteralUtil::CreateR0<int32_t>(subshape.dimensions(i))));
+        dimension_size = inst->AddInstruction(HloInstruction::CreateTernary(
+            dimension_size->shape(), HloOpcode::kClamp, zero, dimension_size,
+            bound));
       }
       slice_operand.push_back(dimension_size);
     }
@@ -2137,9 +2160,7 @@ absl::StatusOr<bool> DynamicPadder::RunImpl(
   FlattenCallGraph flatten_call_graph;
   ABSL_ASSIGN_OR_RETURN(bool changed,
                    flatten_call_graph.Run(module, execution_threads));
-  CallInliner call_inliner(
-      /*single_call_site=*/false,
-      /*update_domain=*/false);
+  CallInliner call_inliner(/*single_call_site=*/false);
   ABSL_ASSIGN_OR_RETURN(bool inliner_changed,
                    call_inliner.Run(module, execution_threads));
   changed |= inliner_changed;

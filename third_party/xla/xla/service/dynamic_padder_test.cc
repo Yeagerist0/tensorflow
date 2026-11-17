@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_replace.h"
 #include "absl/strings/string_view.h"
@@ -40,6 +41,7 @@ limitations under the License.
 #include "xla/hlo/testlib/pattern_matcher_gmock.h"
 #include "xla/hlo/testlib/test.h"
 #include "xla/hlo/testlib/test_helpers.h"
+#include "xla/hlo/testlib/verified_hlo_module.h"
 #include "xla/hlo/transforms/simplifiers/algebraic_simplifier.h"
 #include "xla/hlo/transforms/simplifiers/dynamic_dimension_simplifier.h"
 #include "xla/hlo/transforms/simplifiers/hlo_dce.h"
@@ -64,6 +66,7 @@ namespace {
 
 namespace m = ::xla::match;
 namespace op = xla::testing::opcode_matchers;
+using ::absl_testing::IsOkAndHolds;
 
 OpDynamismSupport OpHasDynamismSupport(HloInstruction* hlo) {
   if (hlo->opcode() != HloOpcode::kCustomCall) {
@@ -149,6 +152,27 @@ class DynamicPadderTest : public HloTestBase {
   std::unique_ptr<HloModule> module_;
   const Shape scalar_shape_ = ShapeUtil::MakeShape(S32, {});
 };
+
+TEST_F(DynamicPadderTest, SliceToDynamicSizeIsClamped) {
+  // Regression test for https://github.com/openxla/xla/issues/44940: the
+  // size operand of set-dimension-size is not otherwise validated, so the
+  // materializing SliceToDynamic must clamp it to [0, bound].
+  const std::string hlo_text = R"(
+HloModule ClampSize
+
+ENTRY main {
+  data = s32[4] parameter(0)
+  size = s32[] parameter(1)
+  ROOT dyn = s32[<=4] set-dimension-size(data, size), dimensions={0}
+}
+)";
+  module_ = GetHloModule(hlo_text);
+  TF_ASSERT_OK(RunPadder(/*slice_dynamic_output=*/true).status());
+  EXPECT_THAT(module_->entry_computation()->root_instruction(),
+              op::CustomCall(
+                  {"SliceToDynamic"}, op::Parameter(0),
+                  op::Clamp(op::Constant(), op::Parameter(1), op::Constant())));
+}
 
 class MemoryAlignmentTest : public HloInterpreterReferenceMixin<HloTestBase> {};
 
@@ -266,9 +290,9 @@ ENTRY main {
   //  OpWithDynamicLowering (custom_call_2)
   //     |
   //  PadToStatic
-  //     |
-  //   Negate
-  //     |
+  //     |     \
+  //   Negate  Clamp(0, size, bound)
+  //      \     /
   //   SliceToDynamic // Root require dynamic form tensor.
   auto custom_call_1 =
       module_->entry_computation()->GetInstructionWithName("custom-call.1");
@@ -326,16 +350,20 @@ ENTRY main {
   //   GTE
   //     |
   //  PadToStatic
-  //     |
-  //   Negate
-  //     |
+  //     |     \
+  //   Negate  Clamp(0, size, bound)
+  //      \     /
   //   SliceToDynamic // Root require dynamic form tensor.
 
   auto* root = module_->entry_computation()->root_instruction();
-  // The final result should use the dynamic size provided by PadToStatic.
-  EXPECT_THAT(root, op::CustomCall(
-                        {"SliceToDynamic"}, op::Negate(),
-                        op::GetTupleElement(op::CustomCall({"PadToStatic"}))));
+  // The final result should use the dynamic size provided by PadToStatic,
+  // clamped to the dimension bound.
+  EXPECT_THAT(
+      root, op::CustomCall(
+                {"SliceToDynamic"}, op::Negate(),
+                op::Clamp(op::Constant(),
+                          op::GetTupleElement(op::CustomCall({"PadToStatic"})),
+                          op::Constant())));
   HloInstruction* negate = root->mutable_operand(0);
   EXPECT_THAT(
       negate,
@@ -377,6 +405,53 @@ ENTRY main {
   HloInstruction* nested_tuple = root->mutable_operand(1);
   EXPECT_THAT(nested_tuple,
               op::Tuple(op::Constant(), op::CustomCall({"SliceToDynamic"})));
+}
+
+TEST_F(DynamicPadderTest, BitcastConvertWideningWithDynamicDimension) {
+  // Regression test for https://github.com/openxla/xla/issues/45967:
+  // a bit-width-changing bitcast-convert on an operand with a dynamic
+  // dimension made the dynamic padder fail with an Unimplemented error.
+  const std::string hlo_text = R"(
+HloModule BitcastConvertWidening
+
+ENTRY main {
+  param = s64[16,1] parameter(0)
+  size = s32[] parameter(1)
+  param_dynamic = s64[<=16,1] set-dimension-size(param, size), dimensions={0}
+  ROOT bitcast = f32[<=16,1,2] bitcast-convert(param_dynamic)
+}
+)";
+
+  module_ = GetHloModule(hlo_text);
+
+  TF_ASSERT_OK(RunPadder(/*slice_dynamic_output=*/true).status());
+  XLA_LOG_LINES(INFO, module_->ToString());
+
+  auto* root = module_->entry_computation()->root_instruction();
+  EXPECT_THAT(root, op::CustomCall({"SliceToDynamic"}));
+}
+
+TEST_F(DynamicPadderTest, BitcastConvertNarrowingWithDynamicDimension) {
+  // Same as above, in the narrowing direction: the major dimensions of the
+  // consumed shape may be dynamic (the contracted minor dimension is static).
+  const std::string hlo_text = R"(
+HloModule BitcastConvertNarrowing
+
+ENTRY main {
+  param = f32[16,2] parameter(0)
+  size = s32[] parameter(1)
+  param_dynamic = f32[<=16,2] set-dimension-size(param, size), dimensions={0}
+  ROOT bitcast = s64[<=16] bitcast-convert(param_dynamic)
+}
+)";
+
+  module_ = GetHloModule(hlo_text);
+
+  TF_ASSERT_OK(RunPadder(/*slice_dynamic_output=*/true).status());
+  XLA_LOG_LINES(INFO, module_->ToString());
+
+  auto* root = module_->entry_computation()->root_instruction();
+  EXPECT_THAT(root, op::CustomCall({"SliceToDynamic"}));
 }
 
 TEST_F(DynamicPadderTest, ConvolutionTest) {
@@ -801,6 +876,46 @@ ENTRY main {
   EXPECT_EQ(offset->parameter_number(), 2);
 }
 
+TEST_F(DynamicPadderTest, ZeroSizedDynamicBinaryOpNotRewritten) {
+  // Regression test for https://github.com/openxla/xla/issues/49925.
+  //
+  // Both operands of an elementwise binary op have a dynamic dimension whose
+  // static bound is zero, so RewriteDynamicBinaryOp must skip the implicit
+  // broadcast rewrite and leave the compare untouched.
+  const std::string hlo_text = R"(
+HloModule module
+
+ENTRY entry {
+  a = f32[0, 2] parameter(0)
+  b = f32[0, 2] parameter(1)
+  size_0 = s32[] parameter(2)
+  size_1 = s32[] parameter(3)
+  a_dynamic = f32[<=0, 2] set-dimension-size(a, size_0), dimensions={0}
+  b_dynamic = f32[<=0, 2] set-dimension-size(b, size_1), dimensions={0}
+  ROOT cmp = pred[<=0, 2] compare(a_dynamic, b_dynamic), direction=EQ
+}
+)";
+  module_ = GetHloModule(hlo_text);
+
+  DynamicPadderOptions options;
+  options.slice_dynamic_output = false;
+  DynamicPadder padder(options);
+  ASSERT_OK_AND_ASSIGN(bool changed, padder.Run(module_.get()));
+  // DynamicDimensionInference and ReplaceSetSize strip the set-dimension-size
+  // ops and clear the dynamic dimensions, so the pass still reports changed.
+  EXPECT_TRUE(changed);
+  ASSERT_OK(verifier().Run(module_.get()).status());
+
+  EXPECT_THAT(module_->entry_computation()->root_instruction(),
+              op::Compare(op::Parameter(0), op::Parameter(1)));
+  for (const HloInstruction* inst :
+       module_->entry_computation()->instructions()) {
+    EXPECT_NE(inst->opcode(), HloOpcode::kSlice);
+    EXPECT_NE(inst->opcode(), HloOpcode::kSelect);
+    EXPECT_NE(inst->opcode(), HloOpcode::kReshape);
+  }
+}
+
 // Test that dynamic padder has the same result as if not padded.
 class ExecutionTest : public HloTestBase {
  protected:
@@ -1158,6 +1273,40 @@ ENTRY main {
   EXPECT_EQ(result, expected);
 }
 
+TEST_F(ExecutionTest, OutOfBoundsDynamicDimensionSizeClamped) {
+  // Regression test for https://github.com/openxla/xla/issues/44940: a
+  // runtime size beyond the dimension bound used to become an unchecked
+  // copy bound in SliceToDynamic, corrupting memory.
+  // The interpreter cannot execute the SliceToDynamic custom call.
+  if (test::DeviceIs(test::kInterpreter)) {
+    GTEST_SKIP();
+  }
+  const std::string hlo_text = R"(
+HloModule OversizeDynamicSize
+
+ENTRY main {
+  data = s32[4] parameter(0)
+  size = s32[] parameter(1)
+  ROOT dyn = s32[<=4] set-dimension-size(data, size), dimensions={0}
+}
+)";
+  Literal data = LiteralUtil::CreateR1<int32_t>({1, 2, 3, 4});
+
+  // An oversize runtime size is clamped to the bound.
+  Literal oversize = LiteralUtil::CreateR0<int32_t>(100000);
+  auto module = GetHloModule(hlo_text);
+  TF_ASSERT_OK_AND_ASSIGN(Literal result,
+                          PadAndExecute(std::move(module), {&data, &oversize}));
+  EXPECT_EQ(result.ToStatic(), LiteralUtil::CreateR1<int32_t>({1, 2, 3, 4}));
+
+  // A negative runtime size is clamped to zero.
+  Literal negative = LiteralUtil::CreateR0<int32_t>(-5);
+  module = GetHloModule(hlo_text);
+  TF_ASSERT_OK_AND_ASSIGN(Literal empty_result,
+                          PadAndExecute(std::move(module), {&data, &negative}));
+  EXPECT_EQ(empty_result.ToStatic(), LiteralUtil::CreateR1<int32_t>({}));
+}
+
 TEST_F(ExecutionTest, DynamicConcat) {
   // Concatting a list of {dynamic_operand, static_operand, dynamic_operand}.
   const std::string hlo_text = R"(
@@ -1191,6 +1340,53 @@ ENTRY main {
                     false));
   result.SetDynamicSize(0, 7);
   Literal expected = LiteralUtil::CreateR1<int32_t>({1, 2, 3, 4, 5, 6, 7});
+
+  EXPECT_EQ(result, expected);
+}
+
+TEST_F(ExecutionTest, BitcastConvertWideningWithDynamicDimension) {
+  const std::string hlo_text = R"(
+HloModule BitcastConvertWidening
+
+ENTRY main {
+  param_0 = s64[3] parameter(0)
+  size = s32[] constant(2)
+  param_padded = s64[<=3] set-dimension-size(param_0, size), dimensions={0}
+  ROOT bitcast = s32[<=3,2] bitcast-convert(param_padded)
+}
+)";
+
+  Literal operand_0 = LiteralUtil::CreateR1<int64_t>({1, 2, -1});
+  auto module = GetHloModule(hlo_text);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      Literal result, PadAndExecute(std::move(module), {&operand_0}, false));
+  result.SetDynamicSize(0, 2);
+  Literal expected = LiteralUtil::CreateR2<int32_t>({{1, 0}, {2, 0}});
+
+  EXPECT_EQ(result, expected);
+}
+
+TEST_F(ExecutionTest, BitcastConvertNarrowingWithDynamicDimension) {
+  const std::string hlo_text = R"(
+HloModule BitcastConvertNarrowing
+
+ENTRY main {
+  param_0 = s32[3,2] parameter(0)
+  size = s32[] constant(2)
+  param_padded = s32[<=3,2] set-dimension-size(param_0, size), dimensions={0}
+  ROOT bitcast = s64[<=3] bitcast-convert(param_padded)
+}
+)";
+
+  Literal operand_0 =
+      LiteralUtil::CreateR2<int32_t>({{1, 0}, {2, 0}, {-1, -1}});
+  auto module = GetHloModule(hlo_text);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      Literal result, PadAndExecute(std::move(module), {&operand_0}, false));
+  result.SetDynamicSize(0, 2);
+  Literal expected = LiteralUtil::CreateR1<int64_t>({1, 2});
 
   EXPECT_EQ(result, expected);
 }
@@ -1917,6 +2113,48 @@ ENTRY entry {
   EXPECT_EQ(result, expected);
 }
 
+TEST_F(ExecutionTest, DynamicBinaryOpOverZeroSizedDimension) {
+  // Regression test for https://github.com/openxla/xla/issues/49925.
+  //
+  // Both operands of an elementwise binary op have a dynamic dimension whose
+  // static bound is zero, so the dimension is always empty and the two dynamic
+  // sizes can never differ. The implicit broadcast rewrite used to slice a
+  // size-1 window out of the empty dimension anyway, which produced an
+  // out-of-bounds slice that failed HLO verification.
+  const std::string hlo_text = R"(
+HloModule module
+
+and_pred (lhs: pred[], rhs: pred[]) -> pred[] {
+  lhs = pred[] parameter(0)
+  rhs = pred[] parameter(1)
+  ROOT and = pred[] and(lhs, rhs)
+}
+
+ENTRY entry {
+  zero_f32 = f32[] constant(0)
+  init = pred[] constant(true)
+  size_0 = s32[] parameter(0)
+  size_1 = s32[] parameter(1)
+  a = f32[0, 2] broadcast(zero_f32), dimensions={}
+  b = f32[0, 2] broadcast(zero_f32), dimensions={}
+  a_dynamic = f32[<=0, 2] set-dimension-size(a, size_0), dimensions={0}
+  b_dynamic = f32[<=0, 2] set-dimension-size(b, size_1), dimensions={0}
+  cmp = pred[<=0, 2] compare(a_dynamic, b_dynamic), direction=EQ
+  ROOT result = pred[2] reduce(cmp, init), dimensions={0}, to_apply=and_pred
+}
+)";
+
+  auto module = GetHloModule(hlo_text);
+
+  Literal size_0 = LiteralUtil::CreateR0<int32_t>(0);
+  Literal size_1 = LiteralUtil::CreateR0<int32_t>(0);
+  ASSERT_OK_AND_ASSIGN(Literal result,
+                       PadAndExecute(std::move(module), {&size_0, &size_1}));
+
+  Literal expected = LiteralUtil::CreateR1<bool>({true, true});
+  EXPECT_EQ(result, expected);
+}
+
 TEST_F(ExecutionTest, DynamicStackPop) {
   // This tests the case where a static sized stack is popped by a dynamic
   // number of times.
@@ -2520,6 +2758,44 @@ ENTRY main {
   ASSERT_OK_AND_ASSIGN(module_, ParseAndReturnVerifiedModule(hlo));
   ASSERT_OK_AND_ASSIGN(bool changed, RunPadder(/*slice_dynamic_output=*/true));
   EXPECT_FALSE(changed);
+}
+
+TEST_F(DynamicPadderTest, ReplaceSetBoundIgnoresLayout) {
+  constexpr absl::string_view kHlo = R"hlo(
+    HloModule main
+
+    ENTRY main {
+      p0 = s32[2,4]{0,1} parameter(0)
+      r = s32[2,4]{1,0} reshape(p0)
+      ROOT sb = s32[2,4]{1,0} custom-call(r), custom_call_target="SetBound", literal=s32[] 2
+    }
+  )hlo";
+  ASSERT_OK_AND_ASSIGN(module_, ParseAndReturnVerifiedModule(kHlo));
+  DynamicDimensionSimplifier simplifier;
+  EXPECT_THAT(simplifier.Run(module_.get()), IsOkAndHolds(true));
+  EXPECT_THAT(RunPadder(), IsOkAndHolds(true));
+  EXPECT_THAT(module_->entry_computation()->root_instruction(),
+              op::Parameter(0));
+}
+
+TEST_F(DynamicPadderTest, ReplaceSetSizeIgnoresLayout) {
+  constexpr absl::string_view kHlo = R"hlo(
+    HloModule main
+
+    ENTRY main {
+      p0 = s32[2,4]{0,1} parameter(0)
+      r = s32[2,4]{1,0} reshape(p0)
+      sb = s32[2,4]{1,0} custom-call(r), custom_call_target="SetBound", literal=s32[] 2
+      size = s32[] constant(2)
+      ROOT sds = s32[<=2,4]{1,0} set-dimension-size(sb, size), dimensions={0}
+    }
+  )hlo";
+  ASSERT_OK_AND_ASSIGN(module_, ParseAndReturnVerifiedModule(kHlo));
+  DynamicDimensionSimplifier simplifier;
+  EXPECT_THAT(simplifier.Run(module_.get()), IsOkAndHolds(true));
+  EXPECT_THAT(RunPadder(), IsOkAndHolds(true));
+  EXPECT_THAT(module_->entry_computation()->root_instruction(),
+              op::Parameter(0));
 }
 
 }  // namespace

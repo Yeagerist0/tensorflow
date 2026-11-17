@@ -4284,6 +4284,11 @@ def TF_DivOp : TF_Op<"Div", [Pure, ResultsBroadcastableShape, TF_SameOperandsAnd
   let description = [{
 *NOTE*: `Div` supports broadcasting. More about broadcasting
 [here](http://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
+
+For signed integer types, dividing the minimum representable value by `-1`
+(e.g. `int_min / -1`) overflows the signed integer range and wraps around to
+the minimum signed integer value in two's complement arithmetic rather than
+raising an exception.
   }];
 
   let arguments = (ins
@@ -5841,6 +5846,11 @@ def TF_FloorDivOp : TF_Op<"FloorDiv", [Pure, ResultsBroadcastableShape]>,
   let description = [{
 *NOTE*: `FloorDiv` supports broadcasting. More about broadcasting
 [here](http://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
+
+For signed integer types, dividing the minimum representable value by `-1`
+(e.g. `int_min / -1`) overflows the signed integer range and wraps around to
+the minimum signed integer value in two's complement arithmetic rather than
+raising an exception.
   }];
 
   let arguments = (ins
@@ -9626,6 +9636,12 @@ a tensor shape `[..., M, K]`.  If `adjoint` is `False` then each output matrix
 satisfies `matrix[..., :, :] * output[..., :, :] = rhs[..., :, :]`.
 If `adjoint` is `True` then each output matrix satisfies
 `adjoint(matrix[..., :, :]) * output[..., :, :] = rhs[..., :, :]`.
+
+If a matrix is not invertible there is no guarantee what the op does. It
+may detect the condition and raise an exception or it may simply return a
+garbage result. In particular, under XLA compilation (e.g.
+`tf.function(jit_compile=True)`) the condition is not detected and the
+result is implementation-defined.
   }];
 
   let arguments = (ins
@@ -20401,6 +20417,11 @@ Python Semantics.
 
 *NOTE*: `TruncateDiv` supports broadcasting. More about broadcasting
 [here](http://docs.scipy.org/doc/numpy/user/basics.broadcasting.html)
+
+For signed integer types, dividing the minimum representable value by `-1`
+(e.g. `int_min / -1`) overflows the signed integer range and wraps around to
+the minimum signed integer value in two's complement arithmetic rather than
+raising an exception.
   }];
 
   let arguments = (ins
@@ -21464,7 +21485,8 @@ either be empty or have the same number of elements as `keys`.}]>:$alternate_key
     BoolAttr:$training,
     StrAttr:$file_path,
     DefaultValuedOptionalAttr<BoolAttr, "false">:$write_vector_predictions,
-    DefaultValuedOptionalAttr<F32Attr, "1.0f">:$sample_rate
+    DefaultValuedOptionalAttr<F32Attr, "1.0f">:$sample_rate,
+    DefaultValuedOptionalAttr<StrAttr, "\"\"">:$date
   );
 
   let results = (outs);

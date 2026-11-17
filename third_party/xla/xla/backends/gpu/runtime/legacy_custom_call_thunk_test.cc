@@ -33,13 +33,13 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/command_state.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk.pb.h"
+#include "xla/backends/gpu/runtime/thunk_test_utils.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/custom_call_status.h"
 #include "xla/service/custom_call_target_registry.h"
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/service/platform_util.h"
-#include "xla/service/service_executable_run_options.h"
 #include "xla/service/shaped_slice.h"
 #include "xla/shape_util.h"
 #include "xla/stream_executor/command_buffer.h"
@@ -49,8 +49,6 @@ limitations under the License.
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/stream_executor/stream_executor_address_allocator.h"
-#include "xla/tsl/lib/core/status_test_util.h"
-#include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/util/proto/parse_text_proto.h"
 #include "xla/xla_data.pb.h"
 
@@ -83,11 +81,11 @@ TEST(LegacyCustomCallThunkTest, SimpleCustomCall) {
       auto thunk, LegacyCustomCallThunk::Create(
                       Thunk::ThunkInfo(), "target_name", target, {}, {}, ""));
   stream_executor::StreamExecutorAddressAllocator allocator(executor);
-  Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), BufferAllocations({}, 0, &allocator),
-      stream.get(), stream.get(), nullptr, nullptr, nullptr);
-  EXPECT_THAT(thunk->ExecuteOnStream(Thunk::ExecuteParams(params)),
-              absl_testing::IsOk());
+  BufferAllocations allocations({}, 0, &allocator);
+  TestThunkParams thunk_params(executor, &allocations, stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get());
+  Thunk::ExecuteParams params = thunk_params.ExecuteParams();
+  EXPECT_THAT(thunk->ExecuteOnStream(params), absl_testing::IsOk());
   EXPECT_TRUE(was_called);
 }
 
@@ -122,12 +120,10 @@ TEST(LegacyCustomCallThunkTest, ResolvesLegacyCustomCall) {
 
   stream_executor::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations empty_unused_allocations({}, 0, &allocator);
-  Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), empty_unused_allocations,
-      /*stream=*/stream.get(),
-      /*command_buffer_trace_stream=*/stream.get(),
-      /*collective_params=*/nullptr,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &empty_unused_allocations,
+                               stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get());
+  Thunk::ExecuteParams params = thunk_params.ExecuteParams();
   EXPECT_THAT(thunk->ExecuteOnStream(params),
               StatusIs(absl::StatusCode::kInternal,
                        HasSubstr("Legacy Custom call was executed!")));
@@ -177,12 +173,10 @@ TEST(LegacyCustomCallThunkTest, LegacyCustomCallRoundTrip) {
 
   stream_executor::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations empty_unused_allocations({}, 0, &allocator);
-  Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), empty_unused_allocations,
-      /*stream=*/stream.get(),
-      /*command_buffer_trace_stream=*/stream.get(),
-      /*collective_params=*/nullptr, /*collective_cliques=*/nullptr,
-      /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &empty_unused_allocations,
+                               stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get());
+  Thunk::ExecuteParams params = thunk_params.ExecuteParams();
 
   // We check that the new thunk behaves like the original one (returning
   // internal error with specific message).
@@ -219,8 +213,8 @@ TEST(LegacyCustomCallThunkTest, RecordCommandBuffer) {
   se::DeviceAddress<uint8_t> dst =
       executor->AllocateArray<uint8_t>(kCopyByteLength, 0);
   std::vector<uint8_t> host_src(kCopyByteLength, 0x5A);
-  TF_ASSERT_OK(stream->Memcpy(&src, host_src.data(), kCopyByteLength));
-  TF_ASSERT_OK(stream->MemZero(&dst, kCopyByteLength));
+  ASSERT_OK(stream->Memcpy(&src, host_src.data(), kCopyByteLength));
+  ASSERT_OK(stream->MemZero(&dst, kCopyByteLength));
 
   BufferAllocation src_alloc{0, kCopyByteLength, 0};
   BufferAllocation dst_alloc{1, kCopyByteLength, 0};
@@ -238,30 +232,27 @@ TEST(LegacyCustomCallThunkTest, RecordCommandBuffer) {
   se::StreamExecutorAddressAllocator allocator(executor);
   BufferAllocations buffer_allocations({src, dst}, 0, &allocator);
 
-  Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), buffer_allocations, stream.get(),
-      /*command_buffer_trace_stream=*/stream.get(),
-      /*collective_params=*/nullptr,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &buffer_allocations, stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get());
+  Thunk::ExecuteParams execute_params = thunk_params.ExecuteParams();
 
   CommandStateManager state;
   Command::RecordParams record_params = {state};
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto command_buffer,
       executor->CreateCommandBuffer(se::CommandBuffer::Mode::kPrimary));
-  TF_ASSERT_OK_AND_ASSIGN(
-      const se::CommandBuffer::Command* cmd,
-      thunk->Record(execute_params, record_params,
-                    Command::RecordCreate{/*dependencies=*/{}},
-                    command_buffer.get()));
+  ASSERT_OK_AND_ASSIGN(const se::CommandBuffer::Command* cmd,
+                       thunk->Record(execute_params, record_params,
+                                     Command::RecordCreate{/*dependencies=*/{}},
+                                     command_buffer.get()));
   ASSERT_NE(cmd, nullptr);
-  TF_ASSERT_OK(command_buffer->Finalize());
-  TF_ASSERT_OK(command_buffer->Submit(stream.get()));
-  TF_ASSERT_OK(stream->BlockHostUntilDone());
+  ASSERT_OK(command_buffer->Finalize());
+  ASSERT_OK(command_buffer->Submit(stream.get()));
+  ASSERT_OK(stream->BlockHostUntilDone());
 
   std::vector<uint8_t> host_dst(kCopyByteLength, 0);
-  TF_ASSERT_OK(stream->Memcpy(host_dst.data(), dst, kCopyByteLength));
+  ASSERT_OK(stream->Memcpy(host_dst.data(), dst, kCopyByteLength));
   EXPECT_EQ(host_dst, host_src);
 }
 
@@ -277,9 +268,9 @@ TEST(LegacyCustomCallThunkTest, RecordCommandBufferUpdate) {
   se::DeviceAddress<uint8_t> dst_second =
       executor->AllocateArray<uint8_t>(kCopyByteLength, 0);
   std::vector<uint8_t> host_src(kCopyByteLength, 0x3C);
-  TF_ASSERT_OK(stream->Memcpy(&src, host_src.data(), kCopyByteLength));
-  TF_ASSERT_OK(stream->MemZero(&dst_first, kCopyByteLength));
-  TF_ASSERT_OK(stream->MemZero(&dst_second, kCopyByteLength));
+  ASSERT_OK(stream->Memcpy(&src, host_src.data(), kCopyByteLength));
+  ASSERT_OK(stream->MemZero(&dst_first, kCopyByteLength));
+  ASSERT_OK(stream->MemZero(&dst_second, kCopyByteLength));
 
   BufferAllocation src_alloc{0, kCopyByteLength, 0};
   BufferAllocation dst_alloc{1, kCopyByteLength, 0};
@@ -297,52 +288,46 @@ TEST(LegacyCustomCallThunkTest, RecordCommandBufferUpdate) {
   se::StreamExecutorAddressAllocator allocator(executor);
 
   BufferAllocations allocs_first({src, dst_first}, 0, &allocator);
-  Thunk::ExecuteParams params_first = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), allocs_first, stream.get(),
-      /*command_buffer_trace_stream=*/stream.get(),
-      /*collective_params=*/nullptr,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  TestThunkParams thunk_params(executor, &allocs_first, stream.get());
+  thunk_params.WithCommandBufferTraceStream(stream.get());
+  Thunk::ExecuteParams params_first = thunk_params.ExecuteParams();
 
   CommandStateManager state;
   Command::RecordParams record_params = {state};
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto command_buffer,
       executor->CreateCommandBuffer(se::CommandBuffer::Mode::kPrimary));
-  TF_ASSERT_OK_AND_ASSIGN(
-      const se::CommandBuffer::Command* cmd,
-      thunk->Record(params_first, record_params,
-                    Command::RecordCreate{/*dependencies=*/{}},
-                    command_buffer.get()));
+  ASSERT_OK_AND_ASSIGN(const se::CommandBuffer::Command* cmd,
+                       thunk->Record(params_first, record_params,
+                                     Command::RecordCreate{/*dependencies=*/{}},
+                                     command_buffer.get()));
   ASSERT_NE(cmd, nullptr);
-  TF_ASSERT_OK(command_buffer->Finalize());
-  TF_ASSERT_OK(command_buffer->Submit(stream.get()));
-  TF_ASSERT_OK(stream->BlockHostUntilDone());
+  ASSERT_OK(command_buffer->Finalize());
+  ASSERT_OK(command_buffer->Submit(stream.get()));
+  ASSERT_OK(stream->BlockHostUntilDone());
 
   std::vector<uint8_t> host_first(kCopyByteLength, 0);
-  TF_ASSERT_OK(stream->Memcpy(host_first.data(), dst_first, kCopyByteLength));
+  ASSERT_OK(stream->Memcpy(host_first.data(), dst_first, kCopyByteLength));
   EXPECT_EQ(host_first, host_src);
 
   // Update with a different destination allocation and re-submit.
   BufferAllocations allocs_second({src, dst_second}, 0, &allocator);
-  Thunk::ExecuteParams params_second = Thunk::ExecuteParams::Create(
-      ServiceExecutableRunOptions(), allocs_second, stream.get(),
-      /*command_buffer_trace_stream=*/stream.get(),
-      /*collective_params=*/nullptr,
-      /*collective_cliques=*/nullptr, /*collective_memory=*/nullptr);
+  Thunk::ExecuteParams params_second =
+      thunk_params.WithBufferAllocations(&allocs_second).ExecuteParams();
 
-  TF_ASSERT_OK(command_buffer->Update());
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK(command_buffer->Update());
+  ASSERT_OK_AND_ASSIGN(
       const se::CommandBuffer::Command* updated_cmd,
       thunk->Record(params_second, record_params, Command::RecordUpdate{cmd},
                     command_buffer.get()));
   EXPECT_EQ(updated_cmd, cmd);
-  TF_ASSERT_OK(command_buffer->Finalize());
-  TF_ASSERT_OK(command_buffer->Submit(stream.get()));
-  TF_ASSERT_OK(stream->BlockHostUntilDone());
+  ASSERT_OK(command_buffer->Finalize());
+  ASSERT_OK(command_buffer->Submit(stream.get()));
+  ASSERT_OK(stream->BlockHostUntilDone());
 
   std::vector<uint8_t> host_second(kCopyByteLength, 0);
-  TF_ASSERT_OK(stream->Memcpy(host_second.data(), dst_second, kCopyByteLength));
+  ASSERT_OK(stream->Memcpy(host_second.data(), dst_second, kCopyByteLength));
   EXPECT_EQ(host_second, host_src);
 }
 

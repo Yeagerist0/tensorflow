@@ -24,7 +24,11 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include "absl/log/check.h"
 #include "absl/strings/string_view.h"
+#include "xla/backends/gpu/codegen/gpu_kernel_spec.h"
 #include "xla/backends/gpu/codegen/kernels/custom_kernel.h"
+#include "xla/codegen/emitters/kernel_arguments.h"
+#include "xla/service/gpu/launch_dimensions.h"
+#include "xla/shape.h"
 #include "xla/stream_executor/cuda/cuda_platform.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/kernel.h"
@@ -32,7 +36,6 @@ limitations under the License.
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
-#include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
 
 namespace xla::gpu::kernel {
@@ -85,17 +88,23 @@ TEST(PtxCustomKernelTest, GetPtxCustomKernel) {
   int64_t length = 4;
   int64_t byte_length = sizeof(int32_t) * length;
   se::gpu::CudaPlatform platform;
-  TF_ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor,
-                          platform.ExecutorForDevice(0));
-  TF_ASSERT_OK_AND_ASSIGN(
-      CustomKernel custom_kernel,
-      GetPtxCustomKernel("AddI32", kAddI32KernelPtx, 3, se::BlockDim(4),
-                         se::ThreadDim(1), byte_length));
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Kernel> kernel,
-                          executor->LoadKernel(custom_kernel.kernel_spec()));
+  ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor,
+                       platform.ExecutorForDevice(0));
 
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
-                          executor->CreateStream());
+  GpuKernelSpec spec{
+      "AddI32", LaunchDimensions{se::BlockDim(4), se::ThreadDim(1)},
+      emitters::KernelArguments{std::vector<emitters::KernelArgument>{
+          emitters::KernelArgument{Shape{S32, {}}},
+          emitters::KernelArgument{Shape{S32, {}}},
+          emitters::KernelArgument{Shape{S32, {}}}}},
+      byte_length};
+  ASSERT_OK_AND_ASSIGN(CustomKernel custom_kernel,
+                       GetPtxCustomKernel(spec, kAddI32KernelPtx));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Kernel> kernel,
+                       executor->LoadKernel(custom_kernel.kernel_spec()));
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
+                       executor->CreateStream());
   se::DeviceAddress<int32_t> a = executor->AllocateArray<int32_t>(length, 0);
   se::DeviceAddress<int32_t> b = executor->AllocateArray<int32_t>(length, 0);
   se::DeviceAddress<int32_t> c = executor->AllocateArray<int32_t>(length, 0);
@@ -125,17 +134,26 @@ TEST(PtxCustomKernelTest, GetPtxCustomKernelWithClusterDim) {
   int64_t length = 4;
   int64_t byte_length = sizeof(int32_t) * length;
   se::gpu::CudaPlatform platform;
-  TF_ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor,
-                          platform.ExecutorForDevice(0));
-  TF_ASSERT_OK_AND_ASSIGN(
-      CustomKernel custom_kernel,
-      GetPtxCustomKernel("AddI32", kAddI32KernelPtx, 3, se::BlockDim(4),
-                         se::ThreadDim(1), se::ClusterDim(2), byte_length));
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Kernel> kernel,
-                          executor->LoadKernel(custom_kernel.kernel_spec()));
+  ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor,
+                       platform.ExecutorForDevice(0));
+  GpuKernelSpec spec{
+      "AddI32",
+      LaunchDimensions{se::BlockDim(4), se::ThreadDim(1)},
+      emitters::KernelArguments{std::vector<emitters::KernelArgument>{
+          emitters::KernelArgument{Shape{S32, {}}},
+          emitters::KernelArgument{Shape{S32, {}}},
+          emitters::KernelArgument{Shape{S32, {}}}}},
+      byte_length,
+      false,
+      {},
+      se::ClusterDim(2)};
+  ASSERT_OK_AND_ASSIGN(CustomKernel custom_kernel,
+                       GetPtxCustomKernel(spec, kAddI32KernelPtx));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Kernel> kernel,
+                       executor->LoadKernel(custom_kernel.kernel_spec()));
 
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
-                          executor->CreateStream());
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
+                       executor->CreateStream());
   se::DeviceAddress<int32_t> a = executor->AllocateArray<int32_t>(length, 0);
   se::DeviceAddress<int32_t> b = executor->AllocateArray<int32_t>(length, 0);
   se::DeviceAddress<int32_t> c = executor->AllocateArray<int32_t>(length, 0);
@@ -203,18 +221,23 @@ TEST(PtxCustomKernelTest, GetOwnedPtxCustomKernel) {
   int64_t length = 4;
   int64_t byte_length = sizeof(int32_t) * length;
   se::gpu::CudaPlatform platform;
-  TF_ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor,
-                          platform.ExecutorForDevice(0));
-  TF_ASSERT_OK_AND_ASSIGN(
-      CustomKernel custom_kernel,
-      GetOwnedPtxCustomKernel("AddI32", kAddI32KernelPtx, 3, se::BlockDim(4),
-                              se::ThreadDim(1), byte_length));
+  ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor,
+                       platform.ExecutorForDevice(0));
+  GpuKernelSpec spec{
+      "AddI32", LaunchDimensions{se::BlockDim(4), se::ThreadDim(1)},
+      emitters::KernelArguments{std::vector<emitters::KernelArgument>{
+          emitters::KernelArgument{Shape{S32, {}}},
+          emitters::KernelArgument{Shape{S32, {}}},
+          emitters::KernelArgument{Shape{S32, {}}}}},
+      byte_length};
+  ASSERT_OK_AND_ASSIGN(CustomKernel custom_kernel,
+                       GetOwnedPtxCustomKernel(spec, kAddI32KernelPtx));
 
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Kernel> kernel,
-                          executor->LoadKernel(custom_kernel.kernel_spec()));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Kernel> kernel,
+                       executor->LoadKernel(custom_kernel.kernel_spec()));
 
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
-                          executor->CreateStream());
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
+                       executor->CreateStream());
   se::DeviceAddress<int32_t> a = executor->AllocateArray<int32_t>(length, 0);
   se::DeviceAddress<int32_t> b = executor->AllocateArray<int32_t>(length, 0);
   se::DeviceAddress<int32_t> c = executor->AllocateArray<int32_t>(length, 0);
